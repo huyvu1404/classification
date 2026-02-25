@@ -1,0 +1,9 @@
+services:
+  classification:
+    build: .
+    env_file:
+      - .env
+    ports:
+      - "${PORT}:${STREAMLIT_PORT}"
+    volumes:
+      - ./auth:/app/auth
