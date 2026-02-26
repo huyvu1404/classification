@@ -5,6 +5,9 @@ from src.classifier import classify_buzz_revelent, classify_buzz_category
 from src.cms import login_cms, get_keywords
 import asyncio
 
+
+PROJECT_LIST = ["ShopeeFood", "Shopee", "SPX Express", "Giao Hàng Nhanh"]
+
 if "disabled" not in st.session_state:
     st.session_state["disabled"] = False
 
@@ -47,7 +50,7 @@ def app():
     
     st.set_page_config(
         page_title="Phân loại dữ liệu",
-        layout="wide"
+        layout="centered"
     )
 
     st.markdown("""
@@ -73,14 +76,10 @@ def app():
         border-radius: 12px 12px 0 0;
     }
 
-    button[data-baseweb="tab"][aria-selected="true"] {
-        background-color: #2563eb !important;
-        color: white !important;
-    }
-    
     button[data-baseweb="tab"]:hover {
         background-color: #dbeafe;
     }
+
     </style>
     """, unsafe_allow_html=True)
 
@@ -118,7 +117,7 @@ def app():
         "Phân loại Relevant / Irrelevant",
         "Phân loại Seller / Buyer"
     ])
-
+    
     with tab_relevant:
         st.markdown(
             '<div class="big-task-title">PHÂN LOẠI RELEVANT / IRRELEVANT</div>',
@@ -144,7 +143,7 @@ def app():
                 st.session_state["df_result_task_1"],
                 "ket_qua_relevant_irrelevant.xlsx"
             )
-
+    
     with tab_seller_buyer:
         st.markdown(
             '<div class="big-task-title">PHÂN LOẠI SELLER / BUYER</div>',
@@ -154,12 +153,19 @@ def app():
         if st.session_state["df_input"] is None:
             st.info("⬆️ Vui lòng upload file Excel trước")
         else:
-            if st.button("⚙️ Xử lý", key="process_seller_buyer"):
-                with st.spinner("Đang phân loại Seller / Buyer..."):
-                    st.session_state["df_result_task_2"] = classify_buzz_category(
-                        st.session_state["df_input"]
-                    )
-                    st.session_state["disabled"] = True
+            selected_project = st.selectbox(
+                "Chọn project",
+                options=PROJECT_LIST
+                )
+            if selected_project:
+                st.session_state["selected_project"] = selected_project
+                if st.button("⚙️ Xử lý", key="process_seller_buyer"):
+                    with st.spinner("Đang phân loại Seller / Buyer..."):
+                        st.session_state["df_result_task_2"] = classify_buzz_category(
+                            st.session_state["df_input"],
+                            project_name=st.session_state["selected_project"]
+                        )
+                        st.session_state["disabled"] = True
 
         if st.session_state["df_result_task_2"] is not None:
             st.success("✅ Xử lý xong!")

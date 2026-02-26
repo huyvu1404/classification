@@ -103,7 +103,7 @@ def classify_buzz_revelent(df):
 
 
 class LabelClassifier:
-    def __init__(self, rules_path: str = RULES_PATH, source_mapping_path: str = SOURCE_MAPPING_PATH):
+    def __init__(self, project_name: str = "ShopeeFood", rules_path: str = RULES_PATH, source_mapping_path: str = SOURCE_MAPPING_PATH):
         """Initialize classifier with rules from JSON file"""
         with open(rules_path, 'r', encoding='utf-8') as f:
             self.rules_data = json.load(f)
@@ -118,6 +118,7 @@ class LabelClassifier:
         self.llm_api_url = os.getenv("LLM_API_URL", "")
         self.llm_api_key = os.getenv("LLM_API_KEY", "")
         self.llm_model = os.getenv("LLM_MODEL", "")
+        self.project_name = project_name
         
         # Load metadata settings
         metadata = self.rules_data.get("metadata", {})
@@ -133,7 +134,7 @@ class LabelClassifier:
         text_parts = []
         
         # Check if it's a topic or comment
-        is_topic = data.get("type", "").lower() in ["fbgrouptopic", "topic"]
+        is_topic = "topic" in data.get("type", "").lower()
         
         if is_topic:
             # For topics, extract title, content, description
@@ -289,24 +290,24 @@ class LabelClassifier:
         
         return None
     
-    def load_pretrained_model(self, project_name: str) -> Tuple[Optional[object], Optional[object]]:
+    def load_pretrained_model(self) -> Tuple[Optional[object], Optional[object]]:
         """
         Load pretrained model and label encoder for a project
         Returns (model, label_encoder) or (None, None) if not available
         """
         # Check cache first
         try:
-            model, label_encoder = loader(project_name)
+            model, label_encoder = loader(self.project_name)
             print
             self.model = model
             self.label_encoder = label_encoder
-            print(f"Loaded pretrained model for project: {project_name}")
+            print(f"Loaded pretrained model for project: {self.project_name}")
            
         except FileNotFoundError as e:
-            print(f"No pretrained model found for project {project_name}: {e}")
+            print(f"No pretrained model found for project {self.project_name}: {e}")
 
         except Exception as e:
-            print(f"Error loading pretrained model for {project_name}: {e}")
+            print(f"Error loading pretrained model for {self.project_name}: {e}")
 
 
     def model_based_classification(self, text: str) -> Tuple[Optional[str], float]:
@@ -335,9 +336,9 @@ class LabelClassifier:
             return None, 0.0
 
     
-    def llm_classification(self, text: str, project_name: str, site_name: str = "", author: str = "") -> tuple:
+    def llm_classification(self, text: str, site_name: str = "", author: str = "") -> tuple:
         """Use LLM to classify when rule-based fails. Returns (label, confidence)"""
-        project_rules = self.get_project_rules(project_name)
+        project_rules = self.get_project_rules(self.project_name)
         if not project_rules:
             return "Unknown", 0.0
         
@@ -371,7 +372,7 @@ class LabelClassifier:
         
         # Enhanced prompt with better instructions for ShopeeFood
         additional_instructions = ""
-        if project_name == "ShopeeFood":
+        if self.project_name == "ShopeeFood":
             additional_instructions = """
 
 CRITICAL CLASSIFICATION RULES:
@@ -400,7 +401,7 @@ CRITICAL CLASSIFICATION RULES:
 DEFAULT: When unsure, classify as USER (not Merchant)"""
         
         # Optimized prompt for Qwen - more structured and direct
-        prompt = f"""Classify the following text into ONE label for project "{project_name}".
+        prompt = f"""Classify the following text into ONE label for project "{self.project_name}".
 
 LABELS:
 {chr(10).join([f"{i+1}. {ld}" for i, ld in enumerate(label_definitions)])}
@@ -502,19 +503,18 @@ ANSWER (format: label|confidence):"""
                 
                 # If no match found, return default label with low confidence
                 print(f"LLM returned invalid label '{label}', using default label")
-                return self.get_default_label(project_name), 0.2
+                return self.get_default_label(self.project_name), 0.2
             else:
                 print(f"LLM API error: {response.status_code}")
-                return self.get_default_label(project_name), 0.0
+                return self.get_default_label(self.project_name), 0.0
                 
         except Exception as e:
             print(f"LLM classification error: {e}")
-            return self.get_default_label(project_name), 0.0
+            return self.get_default_label(self.project_name), 0.0
     
     def classify(self, data: Dict) -> tuple:
         """Main classification method - returns (label, method, confidence)"""
         # Extract project/topic
-        project_name = data.get("topic", "")
         
         # Extract SiteName and Author for source mapping check
         site_name = data.get("siteName", "")
@@ -522,26 +522,26 @@ ANSWER (format: label|confidence):"""
         
         # Extract and merge text early for ownership detection
         text = self.extract_text(data)
-        if project_name == "ShopeeFood":
+        if self.project_name == "ShopeeFood":
         # PRIORITY 1: Check if it's official Brand content (100% confidence)
-            if self.check_brand_indicators(site_name, author, project_name):
+            if self.check_brand_indicators(site_name, author, self.project_name):
                 return "Brand", "BrandIndicator", 1.0
             
             # PRIORITY 2: Check source mapping (Shipper/Merchant groups) (95% confidence)
             if site_name:
-                label = self.check_source_mapping(site_name, project_name)
+                label = self.check_source_mapping(site_name, self.project_name)
                 if label:
                     return label, "SourceMapping", 0.95
             
             if not text:
-                return self.get_default_label(project_name), "NoText", 0.0
+                return self.get_default_label(self.project_name), "NoText", 0.0
             
             # PRIORITY 3: Check for strong merchant ownership indicators (90% confidence)
             if self.detect_merchant_ownership(text, site_name):
                 return "Merchant", "OwnershipDetection", 0.9
             
         # PRIORITY 4: Try rule-based classification (80% confidence)
-        label = self.rule_based_classification(text, project_name)
+        label = self.rule_based_classification(text, self.project_name)
         
         if label is not None:
             return label, "RuleBased", 0.8
@@ -557,7 +557,7 @@ ANSWER (format: label|confidence):"""
         
         # If confidence is below threshold, use default label
         if confidence < self.confidence_threshold:
-            default_label = self.get_default_label(project_name)
+            default_label = self.get_default_label(self.project_name)
             return default_label, "LowConfidence", confidence
         
         return label, "LLM", confidence
@@ -567,7 +567,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import pandas as pd
 
-def classify_buzz_category(df, max_workers: int = 10):
+def classify_buzz_category(df, project_name: str, max_workers: int = 10):
 
     required_columns = ['Id', 'Topic', 'Title', 'Content', 'Description', 'Type', 'SiteName']
     missing_columns = [col for col in required_columns if col not in df.columns]
@@ -578,14 +578,12 @@ def classify_buzz_category(df, max_workers: int = 10):
 
     # Khởi tạo classifier
     print("Đang khởi tạo classifier...")
-    classifier = LabelClassifier()
-    classifier.load_pretrained_model(df["Topic"].iloc[0])  # Load model for the first topic (assuming all rows have same topic)
-    # Hàm phân loại một bản ghi
+    classifier = LabelClassifier(project_name=project_name)
+    classifier.load_pretrained_model()  # Load model for the first topic (assuming all rows have same topic)
+    # Hàm phân loại một bản I
     def classify_row(idx_row):
         idx, row = idx_row
         data = {
-            "id": str(row.get('Id', '')) if pd.notna(row.get('Id')) else '',
-            "topic": str(row.get('Topic', '')) if pd.notna(row.get('Topic')) else '',
             "title": str(row.get('Title', '')) if pd.notna(row.get('Title')) else '',
             "content": str(row.get('Content', '')) if pd.notna(row.get('Content')) else '',
             "description": str(row.get('Description', '')) if pd.notna(row.get('Description')) else '',
@@ -642,7 +640,7 @@ def classify_buzz_category(df, max_workers: int = 10):
 
     # # Thống kê kết quả
     # print("\n=== THỐNG KÊ KẾT QUẢ ===")
-    # print(f"Tổng số bản ghi: {len(df)}")
+    # print(f"Tổng số bản I: {len(df)}")
     
     # print("\n=== PHƯƠNG PHÁP PHÂN LOẠI ===")
     # method_counts = df['Method'].value_counts()
