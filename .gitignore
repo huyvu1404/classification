@@ -8,6 +8,15 @@ wheels/
 
 # Virtual environments
 .venv
-test.ipynb
-auth/
+
+# .env
 .env
+
+# test
+test/
+
+# auth
+auth/
+
+# data
+data/

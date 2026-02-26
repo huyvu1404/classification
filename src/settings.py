@@ -2,7 +2,7 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-PROJECT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__)))
+PROJECT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 CMS_USER_NAME = os.getenv("CMS_USER_NAME", "")
 CMS_PASSWORD = os.getenv("CMS_PASSWORD", "")

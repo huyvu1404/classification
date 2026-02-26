@@ -1,8 +1,8 @@
 import streamlit as st
 import pandas as pd
 from io import BytesIO
-from classify import classify_buzz_revelent, classify_buzz_category
-from cms import login_cms, get_keywords
+from src.classifier import classify_buzz_revelent, classify_buzz_category
+from src.cms import login_cms, get_keywords
 import asyncio
 
 if "disabled" not in st.session_state:
@@ -43,7 +43,8 @@ def download_excel(df: pd.DataFrame, filename: str):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-async def app():
+def app():
+    
     st.set_page_config(
         page_title="Phân loại dữ liệu",
         layout="wide"
@@ -100,11 +101,16 @@ async def app():
     )
 
     if uploaded_file:
-        st.session_state["df_input"] = pd.read_excel(uploaded_file)
+        df = pd.read_excel(uploaded_file)
+        cols = ["Title", "Content", "Description", "TopicId"]
+
+        df[cols] = df[cols].fillna("").astype(str)
+
+        st.session_state["df_input"] = df
 
     if st.session_state["df_input"] is not None:
         st.subheader("🔍 Dữ liệu gốc")
-        st.dataframe(st.session_state["df_input"], width="stretch")
+        st.dataframe(st.session_state["df_input"].head(100), width="stretch")
 
     st.markdown("---")
 
@@ -124,20 +130,14 @@ async def app():
         else:
             if st.button("⚙️ Xử lý", key="process_relevant"):
                 with st.spinner("Đang phân loại Relevant / Irrelevant..."):
-                    tokens = await login_cms()
-                    topic_ids = st.session_state["df_input"]["TopicId"].unique()
-                    kws = {}
-                    for topic_id in topic_ids:
-                        kws[topic_id] = await get_keywords(tokens, topic_id)
-                    st.session_state["df_result_task_1"] = classify_buzz_revelent(
-                        st.session_state["df_input"], kws
-                    )
+                   
+                    st.session_state["df_result_task_1"] = classify_buzz_revelent(st.session_state["df_input"])
                     st.session_state["disabled"] = True
 
         if st.session_state["df_result_task_1"] is not None:
             st.success("✅ Xử lý xong!")
             st.dataframe(
-                st.session_state["df_result_task_1"],
+                st.session_state["df_result_task_1"].head(100),
                 width="stretch"
             )
             download_excel(
@@ -164,7 +164,7 @@ async def app():
         if st.session_state["df_result_task_2"] is not None:
             st.success("✅ Xử lý xong!")
             st.dataframe(
-                st.session_state["df_result_task_2"],
+                st.session_state["df_result_task_2"].head(100),
                 width="stretch"
             )
             download_excel(
@@ -174,4 +174,4 @@ async def app():
 
 
 if __name__ == "__main__":
-    asyncio.run(app())
+    app()
