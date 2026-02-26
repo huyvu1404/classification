@@ -3,6 +3,7 @@ from pyexpat import model
 import unicodedata
 import re
 import json
+import numpy as np
 import os
 from typing import Dict, List, Optional, Tuple
 import requests
@@ -307,33 +308,32 @@ class LabelClassifier:
         except Exception as e:
             print(f"Error loading pretrained model for {project_name}: {e}")
 
-    
-    def model_based_classification(self, text: str) -> Tuple[Optional[str], float]:
-        """
-        Use pretrained model to classify text
-        Returns (label, confidence) or (None, 0.0) if model not available
-        """
 
+    def model_based_classification(self, text: str) -> Tuple[Optional[str], float]:
         if self.model is None or self.label_encoder is None:
             return None, 0.0
-        
+
         try:
-            # Predict using the model
             prediction = self.model.predict([text])[0]
-            
-            # Get probability/confidence if available
+
+            confidence = 0.0
+
             if hasattr(self.model, "decision_function"):
                 scores = self.model.decision_function([text])
-                confidence = float(max(scores[0]))  # Take the highest score as confidence
-   
-            # Decode label
-                label = self.label_encoder.inverse_transform([prediction])[0]
-                
-                return label, confidence
-            
+
+                if isinstance(scores, np.ndarray):
+                    if scores.ndim == 1:
+                        confidence = float(abs(scores[0]))
+                    else:
+                        confidence = float(scores[0].max())
+
+            label = self.label_encoder.inverse_transform([prediction])[0]
+            return label, confidence
+
         except Exception as e:
             print(f"Error during model prediction: {e}")
             return None, 0.0
+
     
     def llm_classification(self, text: str, project_name: str, site_name: str = "", author: str = "") -> tuple:
         """Use LLM to classify when rule-based fails. Returns (label, confidence)"""
@@ -636,9 +636,8 @@ def classify_buzz_category(df, max_workers: int = 10):
     
     # Thêm cột Label, Method và Confidence vào DataFrame
     df['Label'] = labels
-    df['Method'] = methods
-    df['Confidence'] = confidences
-    
+   
+
     # Tạo tên file output nếu không được cung cấp
 
     # # Thống kê kết quả
