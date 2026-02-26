@@ -50,7 +50,7 @@
       ]
     },
     {
-      "project_name": "Giao hàng nhanh",
+      "project_name": "Giao Hàng Nhanh",
       "label_categories": [
         {
           "label_type": "Người Mua Hàng",
@@ -248,7 +248,7 @@
     "notes": "This configuration defines label types, keywords, rules, and examples for automated and manual classification of social media content",
     "default_labels": {
       "ShopeeFood": "User",
-      "Giao hàng nhanh": "Khác",
+      "Giao Hàng Nhanh": "Khác",
       "SPX Express": "Other",
       "Shopee": "BUYER"
     },

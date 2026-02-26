@@ -7,30 +7,23 @@ import numpy as np
 import os
 from typing import Dict, List, Optional, Tuple
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+import pandas as pd
 from dotenv import load_dotenv
 from src.cms import get_keywords, login_cms
 from src.models import loader
 from src.settings import PROJECT_DIR
 
-RULES_PATH = os.path.join(PROJECT_DIR, "src/label-rules.json")
-SOURCE_MAPPING_PATH = os.path.join(PROJECT_DIR, "src/source-mapping.json")
-
 load_dotenv()
 
-
-import asyncio
-import re
-import unicodedata
-import pandas as pd
-from typing import Dict, List
-
+RULES_PATH = os.path.join(PROJECT_DIR, "src/label-rules.json")
+SOURCE_MAPPING_PATH = os.path.join(PROJECT_DIR, "src/source-mapping.json")
 
 class KeywordDetector:
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
         self.topic_keywords: Dict[int, List[str]] = {}
-
-    # ===================== TEXT UTILS =====================
 
     @staticmethod
     def normalize(text: str) -> str:
@@ -55,8 +48,6 @@ class KeywordDetector:
 
         return " ".join(parts)
 
-    # ===================== KEYWORDS =====================
-
     async def load_keywords(self):
         tokens = await login_cms()
 
@@ -66,8 +57,6 @@ class KeywordDetector:
                 self.normalize(kw) for kw in kws if kw
             ]
 
-    # ===================== CLASSIFICATION =====================
-
     def _match_keywords(self, text: str, keywords: List[str]) -> bool:
         for kw in keywords:
             if any(kw_part in text.lower() for kw_part in kw.split(" ")):
@@ -75,7 +64,7 @@ class KeywordDetector:
         return False
 
     async def classify(self) -> pd.DataFrame:
-        # merge + normalize text once
+   
         self.df["_text"] = (
             self.df.apply(self.merge_text, axis=1)
                    .map(self.normalize)
@@ -95,12 +84,6 @@ class KeywordDetector:
             )
 
         return self.df.drop(columns="_text")
-
-
-def classify_buzz_revelent(df):
-    detector = KeywordDetector(df)
-    return asyncio.run(detector.classify())
-
 
 class LabelClassifier:
     def __init__(self, project_name: str = "ShopeeFood", rules_path: str = RULES_PATH, source_mapping_path: str = SOURCE_MAPPING_PATH):
@@ -157,34 +140,32 @@ class LabelClassifier:
         
         # Merge and clean text
         merged_text = " ".join(text_parts)
-        # Remove URLs
+  
         merged_text = re.sub(r'https?://\S+', '', merged_text)
-        # Remove hashtags (optional, keep if needed for classification)
-        # merged_text = re.sub(r'#\w+', '', merged_text)
-        # Remove extra whitespace
+     
         merged_text = re.sub(r'\s+', ' ', merged_text).strip()
         
         return merged_text
     
-    def get_default_label(self, project_name: str) -> str:
+    def get_default_label(self) -> str:
         """Get default label for project when confidence is low"""
-        return self.default_labels.get(project_name, "Unknown")
+        return self.default_labels.get(self.project_name, "Unknown")
     
-    def get_project_rules(self, project_name: str) -> Optional[Dict]:
+    def get_project_rules(self) -> Optional[Dict]:
         """Get rules for specific project"""
         for project in self.rules_data.get("projects", []):
-            if project["project_name"] == project_name:
+            if project["project_name"] == self.project_name:
                 return project
         return None
 
     
-    def check_source_mapping(self, site_name: str, project_name: str) -> Optional[str]:
+    def check_source_mapping(self, site_name: str) -> Optional[str]:
         """Check if SiteName matches predefined source mapping (highest priority)"""
-        if not site_name or project_name not in self.source_mapping:
+        if not site_name or self.project_name not in self.source_mapping:
             return None
         
         # Check each label category for matching source
-        for label_type, sources in self.source_mapping[project_name].items():
+        for label_type, sources in self.source_mapping[self.project_name].items():
             if site_name in sources:
                 return label_type
         
@@ -237,9 +218,9 @@ class LabelClassifier:
         
         return False
     
-    def check_brand_indicators(self, site_name: str, author: str, project_name: str) -> bool:
+    def check_brand_indicators(self, site_name: str, author: str) -> bool:
         """Check if content is from official brand channels"""
-        if project_name == "ShopeeFood":
+        if self.project_name == "ShopeeFood":
             # Official ShopeeFood channels - ONLY the main brand pages
             brand_indicators = [
                 "ShopeeFood VN",
@@ -261,9 +242,9 @@ class LabelClassifier:
         
         return False
     
-    def rule_based_classification(self, text: str, project_name: str) -> Optional[str]:
+    def rule_based_classification(self, text: str) -> Optional[str]:
         """Apply rule-based classification using keywords"""
-        project_rules = self.get_project_rules(project_name)
+        project_rules = self.get_project_rules()
         if not project_rules:
             return None
         
@@ -298,7 +279,6 @@ class LabelClassifier:
         # Check cache first
         try:
             model, label_encoder = loader(self.project_name)
-            print
             self.model = model
             self.label_encoder = label_encoder
             print(f"Loaded pretrained model for project: {self.project_name}")
@@ -338,7 +318,7 @@ class LabelClassifier:
     
     def llm_classification(self, text: str, site_name: str = "", author: str = "") -> tuple:
         """Use LLM to classify when rule-based fails. Returns (label, confidence)"""
-        project_rules = self.get_project_rules(self.project_name)
+        project_rules = self.get_project_rules()
         if not project_rules:
             return "Unknown", 0.0
         
@@ -503,14 +483,14 @@ ANSWER (format: label|confidence):"""
                 
                 # If no match found, return default label with low confidence
                 print(f"LLM returned invalid label '{label}', using default label")
-                return self.get_default_label(self.project_name), 0.2
+                return self.get_default_label(), 0.2
             else:
                 print(f"LLM API error: {response.status_code}")
-                return self.get_default_label(self.project_name), 0.0
+                return self.get_default_label(), 0.0
                 
         except Exception as e:
             print(f"LLM classification error: {e}")
-            return self.get_default_label(self.project_name), 0.0
+            return self.get_default_label(), 0.0
     
     def classify(self, data: Dict) -> tuple:
         """Main classification method - returns (label, method, confidence)"""
@@ -524,24 +504,24 @@ ANSWER (format: label|confidence):"""
         text = self.extract_text(data)
         if self.project_name == "ShopeeFood":
         # PRIORITY 1: Check if it's official Brand content (100% confidence)
-            if self.check_brand_indicators(site_name, author, self.project_name):
+            if self.check_brand_indicators(site_name, author):
                 return "Brand", "BrandIndicator", 1.0
             
             # PRIORITY 2: Check source mapping (Shipper/Merchant groups) (95% confidence)
             if site_name:
-                label = self.check_source_mapping(site_name, self.project_name)
+                label = self.check_source_mapping(site_name)
                 if label:
                     return label, "SourceMapping", 0.95
             
             if not text:
-                return self.get_default_label(self.project_name), "NoText", 0.0
+                return self.get_default_label(), "NoText", 0.0
             
             # PRIORITY 3: Check for strong merchant ownership indicators (90% confidence)
             if self.detect_merchant_ownership(text, site_name):
                 return "Merchant", "OwnershipDetection", 0.9
             
         # PRIORITY 4: Try rule-based classification (80% confidence)
-        label = self.rule_based_classification(text, self.project_name)
+        label = self.rule_based_classification(text)
         
         if label is not None:
             return label, "RuleBased", 0.8
@@ -557,17 +537,15 @@ ANSWER (format: label|confidence):"""
         
         # If confidence is below threshold, use default label
         if confidence < self.confidence_threshold:
-            default_label = self.get_default_label(self.project_name)
+            default_label = self.get_default_label()
             return default_label, "LowConfidence", confidence
         
         return label, "LLM", confidence
 
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-import pandas as pd
 
-def classify_buzz_category(df, project_name: str, max_workers: int = 10):
+
+def classify_buzz_category(df: pd.DataFrame, project_name: str, max_workers: int = 10):
 
     required_columns = ['Id', 'Topic', 'Title', 'Content', 'Description', 'Type', 'SiteName']
     missing_columns = [col for col in required_columns if col not in df.columns]
@@ -616,7 +594,6 @@ def classify_buzz_category(df, project_name: str, max_workers: int = 10):
                     results[idx] = ("Unknown", "Error", 0.0)
                 pbar.update(1)
     
-    # Sắp xếp kết quả theo index và thêm vào DataFrame
     labels = []
     methods = []
     confidences = []
@@ -631,108 +608,13 @@ def classify_buzz_category(df, project_name: str, max_workers: int = 10):
             labels.append("Unknown")
             methods.append("Error")
             confidences.append(0.0)
-    
-    # Thêm cột Label, Method và Confidence vào DataFrame
+
     df['Label'] = labels
-   
 
-    # Tạo tên file output nếu không được cung cấp
-
-    # # Thống kê kết quả
-    # print("\n=== THỐNG KÊ KẾT QUẢ ===")
-    # print(f"Tổng số bản I: {len(df)}")
-    
-    # print("\n=== PHƯƠNG PHÁP PHÂN LOẠI ===")
-    # method_counts = df['Method'].value_counts()
-    # for method, count in method_counts.items():
-    #     percentage = (count / len(df)) * 100
-    #     print(f"  {method}: {count} ({percentage:.1f}%)")
-    
-    # print("\n=== CONFIDENCE STATISTICS ===")
-    # print(f"Average Confidence: {df['Confidence'].mean():.2%}")
-    # print(f"Median Confidence: {df['Confidence'].median():.2%}")
-    # print(f"Min Confidence: {df['Confidence'].min():.2%}")
-    # print(f"Max Confidence: {df['Confidence'].max():.2%}")
-    
-    # # Confidence distribution
-    # low_conf = (df['Confidence'] < 0.9).sum()
-    # med_conf = ((df['Confidence'] >= 0.9) & (df['Confidence'] < 0.95)).sum()
-    # high_conf = (df['Confidence'] >= 0.95).sum()
-    # print(f"\nConfidence Distribution:")
-    # print(f"  Low (<90%): {low_conf} ({low_conf/len(df)*100:.1f}%)")
-    # print(f"  Medium (90-95%): {med_conf} ({med_conf/len(df)*100:.1f}%)")
-    # print(f"  High (≥95%): {high_conf} ({high_conf/len(df)*100:.1f}%)")
-    
-    # # print("\nPhân bố Label:")
-    # # label_counts = df['Label'].value_counts()
-    # # for label, count in label_counts.items():
-    #     percentage = (count / len(df)) * 100
-    #     print(f"  {label}: {count} ({percentage:.1f}%)")
-    
-    # # So sánh Labels1 vs Label (nếu có cột Labels1)
-    # # if 'Labels1' in df.columns:
-    #     print("\n=== SO SÁNH LABELS1 (CHUẨN) VS LABEL ===")
-        
-    #     # Tính độ chính xác
-    #     df['Match'] = df['Labels1'].str.strip().str.lower() == df['Label'].str.strip().str.lower()
-    #     total = len(df)
-    #     correct = df['Match'].sum()
-    #     incorrect = total - correct
-    #     accuracy = (correct / total) * 100
-        
-    #     print(f"Tổng số: {total}")
-    #     print(f"Khớp: {correct} ({accuracy:.2f}%)")
-    #     print(f"Sai lệch: {incorrect} ({100-accuracy:.2f}%)")
-        
-    #     # Chi tiết các trường hợp sai lệch
-    #     if incorrect > 0:
-    #         print("\n=== CHI TIẾT SAI LỆCH ===")
-    #         mismatches = df[~df['Match']][['Id', 'Voice', 'Label', 'Method', 'SiteName', 'Title']]
-            
-    #         # Thống kê sai lệch theo Voice
-    #         print("\nSai lệch theo Voice (chuẩn):")
-    #         for voice_label in sorted(df['Voice'].unique()):
-    #             voice_data = df[df['Voice'] == voice_label]
-    #             voice_mismatches = voice_data[~voice_data['Match']]
-    #             if len(voice_mismatches) > 0:
-    #                 print(f"\n  {voice_label} (Chuẩn):")
-    #                 predicted_counts = voice_mismatches['Label'].value_counts()
-    #                 for pred_label, count in predicted_counts.items():
-    #                     print(f"    → Dự đoán sai thành {pred_label}: {count} lần")
-            
-    #         # In ra một số ví dụ sai lệch
-    #         print("\n=== MỘT SỐ VÍ DỤ SAI LỆCH ===")
-    #         for idx, row in mismatches.head(10).iterrows():
-    #             print(f"\n{'='*80}")
-    #             print(f"ID: {row['Id']}")
-    #             print(f"Voice (Chuẩn): {row['Voice']}")
-    #             print(f"Label (Dự đoán): {row['Label']}")
-    #             print(f"Method: {row['Method']}")
-                
-    #             # Get confidence if available
-    #             if 'Confidence' in df.columns:
-    #                 full_row = df.loc[idx]
-    #                 print(f"Confidence: {full_row['Confidence']:.2%}")
-                
-    #             print(f"SiteName: {row['SiteName']}")
-                
-    #             # Lấy thông tin đầy đủ từ df
-    #             full_row = df.loc[idx]
-                
-    #             title = str(full_row['Title']) if pd.notna(full_row['Title']) else ''
-    #             content = str(full_row['Content']) if pd.notna(full_row['Content']) else ''
-    #             description = str(full_row['Description']) if pd.notna(full_row['Description']) else ''
-    #             type_val = str(full_row['Type']) if pd.notna(full_row['Type']) else ''
-                
-    #             print(f"Type: {type_val}")
-                
-    #             if title:
-    #                 print(f"\nTitle:\n{title}")
-    #             if content:
-    #                 print(f"\nContent:\n{content}")
-    #             if description:
-    #                 print(f"\nDescription:\n{description}")
-                
-    #             print(f"{'='*80}")
-    
     return df
+
+
+
+def classify_buzz_revelent(df):
+    detector = KeywordDetector(df)
+    return asyncio.run(detector.classify())
