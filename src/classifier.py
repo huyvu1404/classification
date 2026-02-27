@@ -20,6 +20,14 @@ load_dotenv()
 RULES_PATH = os.path.join(PROJECT_DIR, "src/label-rules.json")
 SOURCE_MAPPING_PATH = os.path.join(PROJECT_DIR, "src/source-mapping.json")
 
+
+def sanitize_excel_values(df: pd.DataFrame):
+    df = df.copy()
+    for col in df.columns:
+        df[col] = df[col].apply(
+            lambda x: f"'{x}" if isinstance(x, str) and x.strip().startswith('=') else x
+        )
+    return df
 class KeywordDetector:
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
@@ -177,16 +185,12 @@ class LabelClassifier:
         
         # Strong ownership indicators
         ownership_keywords = [
-            "quán mình",
-            "shop mình", 
             "shop tôi",
             "quán tôi",
             "shop chúng tôi",
             "quán chúng tôi",
-            "cửa hàng mình",
             "cửa hàng chúng tôi",
-            "nhà hàng mình",
-            "bên mình",
+            "nhà hàng chúng tôi",
             "em làm",
             "nhà em",
             "quán em"
@@ -218,9 +222,9 @@ class LabelClassifier:
         
         return False
     
-    def check_brand_indicators(self, site_name: str, author: str) -> bool:
+    def check_brand_indicators(self, site_name: str, buzz_type: str, author: str) -> bool:
         """Check if content is from official brand channels"""
-        if self.project_name == "ShopeeFood":
+        if self.project_name == "ShopeeFood" and "topic" in buzz_type:
             # Official ShopeeFood channels - ONLY the main brand pages
             brand_indicators = [
                 "ShopeeFood VN",
@@ -499,12 +503,15 @@ ANSWER (format: label|confidence):"""
         # Extract SiteName and Author for source mapping check
         site_name = data.get("siteName", "")
         author = data.get("author", "")
-        
+        buzz_type = data.get("type", "")
         # Extract and merge text early for ownership detection
         text = self.extract_text(data)
+        if not text:
+            return self.get_default_label(), "NoText", 0.0
+        
         if self.project_name == "ShopeeFood":
         # PRIORITY 1: Check if it's official Brand content (100% confidence)
-            if self.check_brand_indicators(site_name, author):
+            if self.check_brand_indicators(site_name, buzz_type, author):
                 return "Brand", "BrandIndicator", 1.0
             
             # PRIORITY 2: Check source mapping (Shipper/Merchant groups) (95% confidence)
@@ -512,13 +519,10 @@ ANSWER (format: label|confidence):"""
                 label = self.check_source_mapping(site_name)
                 if label:
                     return label, "SourceMapping", 0.95
-            
-            if not text:
-                return self.get_default_label(), "NoText", 0.0
-            
-            # PRIORITY 3: Check for strong merchant ownership indicators (90% confidence)
-            if self.detect_merchant_ownership(text, site_name):
-                return "Merchant", "OwnershipDetection", 0.9
+              
+            # # PRIORITY 3: Check for strong merchant ownership indicators (90% confidence)
+            # if self.detect_merchant_ownership(text, site_name):
+            #     return "Merchant", "OwnershipDetection", 0.9
             
         # PRIORITY 4: Try rule-based classification (80% confidence)
         label = self.rule_based_classification(text)
@@ -547,7 +551,7 @@ ANSWER (format: label|confidence):"""
 
 def classify_buzz_category(df: pd.DataFrame, project_name: str, max_workers: int = 10):
 
-    required_columns = ['Id', 'Topic', 'Title', 'Content', 'Description', 'Type', 'SiteName']
+    required_columns = ['Id', 'Topic', 'Title', 'Content', 'Description', 'Type', 'SiteName', 'Author']
     missing_columns = [col for col in required_columns if col not in df.columns]
     
     if missing_columns:
@@ -610,11 +614,12 @@ def classify_buzz_category(df: pd.DataFrame, project_name: str, max_workers: int
             confidences.append(0.0)
 
     df['Label'] = labels
-
+    df = sanitize_excel_values(df)
     return df
-
 
 
 def classify_buzz_revelent(df):
     detector = KeywordDetector(df)
-    return asyncio.run(detector.classify())
+    df = asyncio.run(detector.classify())
+    df = sanitize_excel_values(df)
+    return df
