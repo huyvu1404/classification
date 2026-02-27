@@ -22,6 +22,8 @@ load_dotenv()
 RULES_PATH = os.path.join(PROJECT_DIR, "src/rules/label-rules.json")
 SOURCE_MAPPING_PATH = os.path.join(PROJECT_DIR, "src/rules/source-mapping.json")
 SPECIAL_PROJECT = "ShopeeFood"
+
+
 class KeywordDetector:
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
