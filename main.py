@@ -2,9 +2,6 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 from src.classifier import classify_buzz_revelent, classify_buzz_category
-from src.cms import login_cms, get_keywords
-import asyncio
-
 
 PROJECT_LIST = ["ShopeeFood", "Shopee", "SPX Express", "Giao Hàng Nhanh"]
 

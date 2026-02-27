@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import pandas as pd
 from dotenv import load_dotenv
-from src.cms import get_keywords, login_cms
+from src.get_kws import get_keywords, login_cms
 from src.models import loader
 from src.settings import PROJECT_DIR
 from src.utils import sanitize_excel_values, clean_lower_text
@@ -19,8 +19,8 @@ from src.utils import sanitize_excel_values, clean_lower_text
 
 load_dotenv()
 
-RULES_PATH = os.path.join(PROJECT_DIR, "src/label-rules.json")
-SOURCE_MAPPING_PATH = os.path.join(PROJECT_DIR, "src/source-mapping.json")
+RULES_PATH = os.path.join(PROJECT_DIR, "src/rules/label-rules.json")
+SOURCE_MAPPING_PATH = os.path.join(PROJECT_DIR, "src/rules/source-mapping.json")
 SPECIAL_PROJECT = "ShopeeFood"
 class KeywordDetector:
     def __init__(self, df: pd.DataFrame):
