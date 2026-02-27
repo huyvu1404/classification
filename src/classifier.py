@@ -14,20 +14,14 @@ from dotenv import load_dotenv
 from src.cms import get_keywords, login_cms
 from src.models import loader
 from src.settings import PROJECT_DIR
+from src.utils import sanitize_excel_values, clean_lower_text
+
 
 load_dotenv()
 
 RULES_PATH = os.path.join(PROJECT_DIR, "src/label-rules.json")
 SOURCE_MAPPING_PATH = os.path.join(PROJECT_DIR, "src/source-mapping.json")
-
-
-def sanitize_excel_values(df: pd.DataFrame):
-    df = df.copy()
-    for col in df.columns:
-        df[col] = df[col].apply(
-            lambda x: f"'{x}" if isinstance(x, str) and x.strip().startswith('=') else x
-        )
-    return df
+SPECIAL_PROJECT = "ShopeeFood"
 class KeywordDetector:
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
@@ -179,52 +173,10 @@ class LabelClassifier:
         
         return None
     
-    def detect_merchant_ownership(self, text: str, site_name: str) -> bool:
-        """Detect if content shows restaurant/shop ownership perspective"""
-        text_lower = text.lower()
-        
-        # Strong ownership indicators
-        ownership_keywords = [
-            "shop tôi",
-            "quán tôi",
-            "shop chúng tôi",
-            "quán chúng tôi",
-            "cửa hàng chúng tôi",
-            "nhà hàng chúng tôi",
-            "em làm",
-            "nhà em",
-            "quán em"
-        ]
-        
-        for keyword in ownership_keywords:
-            if keyword in text_lower:
-                return True
-        
-        # Check if SiteName is a restaurant/shop name (not a group or personal page)
-        # Restaurant pages usually don't have these patterns
-        non_merchant_patterns = [
-            "hà nội",
-            "sài gòn", 
-            "ăn gì",
-            "ở đâu",
-            "cộng đồng",
-            "hội",
-            "group",
-            "foody"
-        ]
-        
-        site_name_lower = site_name.lower()
-        has_non_merchant_pattern = any(pattern in site_name_lower for pattern in non_merchant_patterns)
-        
-        # If no ownership keywords and site name suggests it's not a merchant, return False
-        if has_non_merchant_pattern:
-            return False
-        
-        return False
-    
     def check_brand_indicators(self, site_name: str, buzz_type: str, author: str) -> bool:
         """Check if content is from official brand channels"""
-        if self.project_name == "ShopeeFood" and "topic" in buzz_type:
+
+        if "topic" in clean_lower_text(buzz_type):
             # Official ShopeeFood channels - ONLY the main brand pages
             brand_indicators = [
                 "ShopeeFood VN",
@@ -232,11 +184,11 @@ class LabelClassifier:
             ]
             
             # Check SiteName or Author - must be exact match or very close
-            site_name_lower = site_name.lower()
-            author_lower = author.lower()
+            site_name_lower = clean_lower_text(site_name)
+            author_lower = clean_lower_text(author)
             
             for indicator in brand_indicators:
-                indicator_lower = indicator.lower()
+                indicator_lower = clean_lower_text(indicator)
                 # Exact match or starts with the indicator
                 if (site_name_lower == indicator_lower or 
                     author_lower == indicator_lower or
@@ -509,7 +461,7 @@ ANSWER (format: label|confidence):"""
         if not text:
             return self.get_default_label(), "NoText", 0.0
         
-        if self.project_name == "ShopeeFood":
+        if clean_lower_text(self.project_name) == clean_lower_text(SPECIAL_PROJECT):
         # PRIORITY 1: Check if it's official Brand content (100% confidence)
             if self.check_brand_indicators(site_name, buzz_type, author):
                 return "Brand", "BrandIndicator", 1.0
