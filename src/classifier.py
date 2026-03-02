@@ -75,6 +75,11 @@ class KeywordDetector:
         )
 
         self.df["Yes/No"] = "No"
+        
+        # Check if Sentiment column exists and mark Positive/Negative as Yes
+        if "Sentiment" in self.df.columns:
+            sentiment_mask = self.df["Sentiment"].isin(["Positive", "Negative"])
+            self.df.loc[sentiment_mask, "Yes/No"] = "Yes"
 
         await self.load_keywords()
 
@@ -82,10 +87,15 @@ class KeywordDetector:
             if not keywords:
                 continue
 
-            mask = self.df["TopicId"] == topic_id
-            self.df.loc[mask, "Yes/No"] = self.df.loc[mask, "_text"].map(
-                lambda text: "Yes" if self._match_keywords(text, keywords) else "No"
-            )
+            # Only check keywords for rows that are still "No" (not already marked by Sentiment)
+            topic_mask = self.df["TopicId"] == topic_id
+            no_mask = self.df["Yes/No"] == "No"
+            rows_to_check = topic_mask & no_mask
+            
+            if rows_to_check.any():
+                self.df.loc[rows_to_check, "Yes/No"] = self.df.loc[rows_to_check, "_text"].map(
+                    lambda text: "Yes" if self._match_keywords(text, keywords) else "No"
+                )
 
         return self.df.drop(columns="_text")
 

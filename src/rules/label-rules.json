@@ -249,7 +249,7 @@
     "default_labels": {
       "ShopeeFood": "User",
       "Giao Hàng Nhanh": "Khác",
-      "SPX Express": "Others",
+      "SPX Express": "Otherc",
       "Shopee": "BUYER"
     },
     "confidence_threshold": 0.2
