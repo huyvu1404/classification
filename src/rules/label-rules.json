@@ -217,7 +217,7 @@
             "phí vận chuyển",
             "hàng bị hoàn trả"
           ],
-          "rules": "Content from sellers posting/commenting. Indicators: mentions 'packing orders', 'sending goods', 'shipping to customers', 'packaging', 'confirming orders'. Complaints about delivery from sender perspective. Mentions sales, platform fees, taxes, order count, return rate, shipping fees (seller viewpoint). Mentions returned goods, used returned items. Keywords: 'my shop', 'we sell', 'give to delivery service', 'shop's order', 'seller'. Some sources can be confirmed as SELLER",
+          "rules": "Content from sellers posting/commenting. Indicators: mentions 'selling product', 'advertising', 'promotions', 'packing orders', 'sending goods', 'shipping to customers', 'packaging', 'confirming orders'. Complaints about delivery from sender perspective. Mentions sales, platform fees, taxes, order count, return rate, shipping fees (seller viewpoint). Mentions returned goods, used returned items. Keywords: 'my shop', 'we sell', 'give to delivery service', 'shop's order', 'seller'. Some sources can be confirmed as SELLER",
           "examples": []
         },
         {
@@ -252,6 +252,6 @@
       "SPX Express": "Otherc",
       "Shopee": "BUYER"
     },
-    "confidence_threshold": 0.2
+    "confidence_threshold": 0.5
   }
 }

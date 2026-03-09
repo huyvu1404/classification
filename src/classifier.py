@@ -16,88 +16,11 @@ from src.models import loader
 from src.settings import PROJECT_DIR
 from src.utils import sanitize_excel_values, clean_lower_text
 
-
 load_dotenv()
 
 RULES_PATH = os.path.join(PROJECT_DIR, "src/rules/label-rules.json")
 SOURCE_MAPPING_PATH = os.path.join(PROJECT_DIR, "src/rules/source-mapping.json")
 SPECIAL_PROJECT = "ShopeeFood"
-
-
-class KeywordDetector:
-    def __init__(self, df: pd.DataFrame):
-        self.df = df.copy()
-        self.topic_keywords: Dict[int, List[str]] = {}
-
-    @staticmethod
-    def normalize(text: str) -> str:
-        if not text:
-            return ""
-
-        text = unicodedata.normalize("NFKD", text)
-        text = "".join(c for c in text if not unicodedata.combining(c))
-        text = re.sub(r"[^\w\s]", " ", text)
-        return re.sub(r"\s+", " ", text).lower().strip()
-
-    @staticmethod
-    def merge_text(row: pd.Series) -> str:
-        if "comment" in str(row.get("Type", "")).lower():
-            return str(row.get("Content", ""))
-
-        parts = []
-        for col in ("Title", "Content", "Description"):
-            val = str(row.get(col, "")).strip()
-            if val and val not in parts:
-                parts.append(val)
-
-        return " ".join(parts)
-
-    async def load_keywords(self):
-        tokens = await login_cms()
-
-        for topic_id in self.df["TopicId"].unique():
-            kws = await get_keywords(tokens, topic_id)
-            self.topic_keywords[topic_id] = [
-                self.normalize(kw) for kw in kws if kw
-            ]
-
-    def _match_keywords(self, text: str, keywords: List[str]) -> bool:
-        for kw in keywords:
-            if any(kw_part in text.lower() for kw_part in kw.split(" ")):
-                return True
-        return False
-
-    async def classify(self) -> pd.DataFrame:
-   
-        self.df["_text"] = (
-            self.df.apply(self.merge_text, axis=1)
-                   .map(self.normalize)
-        )
-
-        self.df["Yes/No"] = "No"
-        
-        # Check if Sentiment column exists and mark Positive/Negative as Yes
-        if "Sentiment" in self.df.columns:
-            sentiment_mask = self.df["Sentiment"].isin(["Positive", "Negative"])
-            self.df.loc[sentiment_mask, "Yes/No"] = "Yes"
-
-        await self.load_keywords()
-
-        for topic_id, keywords in self.topic_keywords.items():
-            if not keywords:
-                continue
-
-            # Only check keywords for rows that are still "No" (not already marked by Sentiment)
-            topic_mask = self.df["TopicId"] == topic_id
-            no_mask = self.df["Yes/No"] == "No"
-            rows_to_check = topic_mask & no_mask
-            
-            if rows_to_check.any():
-                self.df.loc[rows_to_check, "Yes/No"] = self.df.loc[rows_to_check, "_text"].map(
-                    lambda text: "Yes" if self._match_keywords(text, keywords) else "No"
-                )
-
-        return self.df.drop(columns="_text")
 
 class LabelClassifier:
     def __init__(self, project_name: str = "ShopeeFood", rules_path: str = RULES_PATH, source_mapping_path: str = SOURCE_MAPPING_PATH):
@@ -349,24 +272,21 @@ CRITICAL CLASSIFICATION RULES:
 DEFAULT: When unsure, classify as USER (not Merchant)"""
         
         # Optimized prompt for Qwen - more structured and direct
-        prompt = f"""Classify the following text into ONE label for project "{self.project_name}".
+        prompt = f"""You are a text classifier. Return ONLY the label name, nothing else. No thinking, no explanation.
+Your task is classify the following text into ONE label for project "{self.project_name}".
 
-LABELS:
+** LABELS **
 {chr(10).join([f"{i+1}. {ld}" for i, ld in enumerate(label_definitions)])}
 {context_info}
 {additional_instructions}
 
-TEXT:
-{text}
-
-INSTRUCTIONS:
+** INSTRUCTIONS **
 - Read the text carefully and identify the AUTHOR'S ROLE/PERSPECTIVE
 - Match content to the most appropriate label based on who is posting and their perspective
-- Return ONLY the label name followed by confidence score (0-100)
-- Format: <label>|<confidence>
-- Example: User|85 or Merchant|70
 
-ANSWER (format: label|confidence):"""
+** OUTPUT FORMAT **
+- Return ONLY the label name followed by confidence score (0-100) in format: <label>|<confidence>
+"""
         
         try:
             headers = {
@@ -383,8 +303,9 @@ ANSWER (format: label|confidence):"""
                 json={
                     "model": self.llm_model,
                     "messages": [
-                        {"role": "system", "content": "You are a text classifier. Return ONLY the label name, nothing else. No thinking, no explanation."},
-                        {"role": "user", "content": prompt}
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": f"""Text need to classify:
+{text}"""}
                     ],
                     "temperature": 0.1,
                     "max_tokens": 20,
@@ -501,7 +422,7 @@ ANSWER (format: label|confidence):"""
             return label, "PretrainedModel", confidence
         
         # PRIORITY 6: If model fails or low confidence, use LLM with confidence score
-        # label, confidence = self.llm_classification(text, project_name, site_name, author)
+        label, confidence = self.llm_classification(text, site_name, author)
         
         # If confidence is below threshold, use default label
         if confidence < self.confidence_threshold:
@@ -513,77 +434,71 @@ ANSWER (format: label|confidence):"""
 
 
 
-def classify_buzz_category(df: pd.DataFrame, project_name: str, max_workers: int = 10):
+def classify_category(df: pd.DataFrame, project_name: str, max_workers: int = 10):
 
     required_columns = ['Id', 'Topic', 'Title', 'Content', 'Description', 'Type', 'SiteName', 'Author']
     missing_columns = [col for col in required_columns if col not in df.columns]
-    
+
     if missing_columns:
         print(f"Cảnh báo: Các cột sau không tồn tại trong file: {missing_columns}")
         print(f"Các cột hiện có: {list(df.columns)}")
 
-    # Khởi tạo classifier
     print("Đang khởi tạo classifier...")
     classifier = LabelClassifier(project_name=project_name)
-    classifier.load_pretrained_model()  # Load model for the first topic (assuming all rows have same topic)
-    # Hàm phân loại một bản I
-    def classify_row(idx_row):
-        idx, row = idx_row
+    classifier.load_pretrained_model()
+
+    def classify_row(row):
+        idx = row.Index
+
         data = {
-            "title": str(row.get('Title', '')) if pd.notna(row.get('Title')) else '',
-            "content": str(row.get('Content', '')) if pd.notna(row.get('Content')) else '',
-            "description": str(row.get('Description', '')) if pd.notna(row.get('Description')) else '',
-            "type": str(row.get('Type', '')) if pd.notna(row.get('Type')) else '',
-            "siteName": str(row.get('SiteName', '')) if pd.notna(row.get('SiteName')) else '',
-            "author": str(row.get('Author', '')) if pd.notna(row.get('Author')) else '',
+            "title": str(getattr(row, "Title", "")) if pd.notna(getattr(row, "Title", "")) else "",
+            "content": str(getattr(row, "Content", "")) if pd.notna(getattr(row, "Content", "")) else "",
+            "description": str(getattr(row, "Description", "")) if pd.notna(getattr(row, "Description", "")) else "",
+            "type": str(getattr(row, "Type", "")) if pd.notna(getattr(row, "Type", "")) else "",
+            "siteName": str(getattr(row, "SiteName", "")) if pd.notna(getattr(row, "SiteName", "")) else "",
+            "author": str(getattr(row, "Author", "")) if pd.notna(getattr(row, "Author", "")) else "",
         }
-        
+
         label, method, confidence = classifier.classify(data)
+
         return idx, label, method, confidence
-    
-    # Phân loại song song
+
     print(f"Đang phân loại với {max_workers} workers...")
-    results = {}
-    
+
+    results = [None] * len(df)
+    row = next(df.itertuples())
+    print(row._fields)
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
-        futures = {executor.submit(classify_row, (idx, row)): idx 
-                  for idx, row in df.iterrows()}
-        
-        # Process completed tasks with progress bar
+
+        futures = {
+            executor.submit(classify_row, row): row.Index
+            for row in df.itertuples()
+        }
+
         with tqdm(total=len(df), desc="Processing") as pbar:
+
             for future in as_completed(futures):
+
                 try:
                     idx, label, method, confidence = future.result()
                     results[idx] = (label, method, confidence)
+
                 except Exception as e:
                     idx = futures[future]
                     print(f"\nError processing row {idx}: {e}")
                     results[idx] = ("Unknown", "Error", 0.0)
+
                 pbar.update(1)
-    
-    labels = []
-    methods = []
-    confidences = []
-    
-    for idx in df.index:
-        if idx in results:
-            label, method, confidence = results[idx]
-            labels.append(label)
-            methods.append(method)
-            confidences.append(confidence)
-        else:
-            labels.append("Unknown")
-            methods.append("Error")
-            confidences.append(0.0)
+
+    # unpack results
+    labels, methods, confidences = zip(*results)
 
     df['Label'] = labels
+    df['Method'] = methods
+    df['Confidence'] = confidences
+
     df = sanitize_excel_values(df)
+
     return df
 
-
-def classify_buzz_revelent(df):
-    detector = KeywordDetector(df)
-    df = asyncio.run(detector.classify())
-    df = sanitize_excel_values(df)
-    return df

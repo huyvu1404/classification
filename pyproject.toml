@@ -14,5 +14,6 @@ dependencies = [
     "pandas>=2.3.3",
     "scikit-learn==1.6.1",
     "streamlit>=1.54.0",
+    "underthesea>=9.2.11",
     "xlsxwriter>=3.2.9",
 ]

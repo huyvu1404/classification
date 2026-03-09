@@ -1,9 +1,11 @@
 import streamlit as st
 import pandas as pd
 from io import BytesIO
-from src.classifier import classify_buzz_revelent, classify_buzz_category
+from src.classifier import classify_category
+from src.detector import detect_relevant
 
 PROJECT_LIST = ["ShopeeFood", "Shopee", "SPX Express", "Giao Hàng Nhanh"]
+DETECTOR_PROJECT_LIST = ["Vinamilk"]
 
 if "disabled" not in st.session_state:
     st.session_state["disabled"] = False
@@ -124,11 +126,25 @@ def app():
         if st.session_state["df_input"] is None:
             st.info("⬆️ Vui lòng upload file Excel trước")
         else:
-            if st.button("⚙️ Xử lý", key="process_relevant"):
-                with st.spinner("Đang phân loại Relevant / Irrelevant..."):
-                   
-                    st.session_state["df_result_task_1"] = classify_buzz_revelent(st.session_state["df_input"])
-                    st.session_state["disabled"] = True
+            # Chọn project cho relevant classification
+            selected_project_relevant = st.selectbox(
+                "Chọn project",
+                options=DETECTOR_PROJECT_LIST,
+                key="project_relevant"
+            )
+            
+            if selected_project_relevant:
+                st.session_state["selected_project_relevant"] = selected_project_relevant
+                
+                if st.button("⚙️ Xử lý", key="process_relevant"):
+                    with st.spinner(f"Đang phân loại Relevant / Irrelevant cho {selected_project_relevant}..."):
+                        st.session_state["df_result_task_1"] = detect_relevant(
+                            st.session_state["df_input"],
+                            project_name=st.session_state["selected_project_relevant"],
+                            use_llm=True,
+                            batch_size=10
+                        )
+                        st.session_state["disabled"] = True
 
         if st.session_state["df_result_task_1"] is not None:
             st.success("✅ Xử lý xong!")
@@ -158,7 +174,7 @@ def app():
                 st.session_state["selected_project"] = selected_project
                 if st.button("⚙️ Xử lý", key="process_seller_buyer"):
                     with st.spinner("Đang phân loại Seller / Buyer..."):
-                        st.session_state["df_result_task_2"] = classify_buzz_category(
+                        st.session_state["df_result_task_2"] = classify_category(
                             st.session_state["df_input"],
                             project_name=st.session_state["selected_project"]
                         )
