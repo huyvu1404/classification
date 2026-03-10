@@ -166,6 +166,7 @@ class Detector:
                 if val and val not in parts:
                     parts.append(val)
         return " ".join(parts)
+    
     def _clean_content_for_empty_check(self, text: str) -> str:
         """
         Clean content by removing whitespace, emojis, and links

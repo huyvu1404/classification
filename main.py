@@ -100,7 +100,8 @@ def app():
 
     if uploaded_file:
         df = pd.read_excel(uploaded_file)
-        cols = ["Title", "Content", "Description", "TopicId"]
+
+        cols = ["SiteId", "Title", "Content", "Description", "TopicId"]
 
         df[cols] = df[cols].fillna("").astype(str)
 
