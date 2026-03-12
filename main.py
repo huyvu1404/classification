@@ -4,7 +4,7 @@ from io import BytesIO
 from src.classifier import classify_category
 from src.detector import detect_relevant
 
-PROJECT_LIST = ["ShopeeFood", "Shopee", "SPX Express", "Giao Hàng Nhanh"]
+PROJECT_LIST = ["Shopee", "ShopeeFood", "SPX Express", "Giao Hàng Nhanh"]
 DETECTOR_PROJECT_LIST = ["Vinamilk"]
 
 if "disabled" not in st.session_state:

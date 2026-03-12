@@ -1,14 +1,47 @@
 {
     "Shopee": {
         "BUYER": [
-            "affiliate",
-            "tiếp thị link",
-            "tiếp thị liên kết",
-            "săn sale",
-            "săn mã",
-            "siêu sale",
-            "sieusale",
-            "chốt đơn"
+            {
+                "condition": {},
+                "keywords": [
+                    "affiliate",
+                    "tiếp thị link",
+                    "tiếp thị liên kết",
+                    "săn sale",
+                    "săn mã",
+                    "siêu sale",
+                    "sieusale",
+                    "chốt đơn",
+                    "sansale",
+                    "chotdon",
+                    "tiepthilienket",
+                    "ttlk",
+                    "aff",
+                    "affi"
+                ]
+            },
+            {
+                "condition": {
+                    "type": "page",
+                    "siteName": "Shopee"
+                },
+                "keywords": [
+                    "mini game",
+                    "minigame"
+                ]
+            }
+        ],
+        "SELLER": [
+            {
+                "condition": {
+                    "type": "group",
+                    "siteName": ""
+                },
+                "keywords": [
+                    "mini game",
+                    "minigame"
+                ]
+            }
         ]
     }
 }

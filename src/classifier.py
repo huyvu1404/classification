@@ -3,9 +3,9 @@ import json
 import numpy as np
 import os
 import unicodedata
+import asyncio
 from typing import Dict, List, Optional, Tuple
-import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import aiohttp
 from tqdm import tqdm
 import pandas as pd
 from dotenv import load_dotenv
@@ -36,12 +36,14 @@ class LabelClassifier:
         self.llm_api_url = os.getenv("LLM_API_URL", "")
         self.llm_api_key = os.getenv("LLM_API_KEY", "")
         self.llm_model = os.getenv("LLM_MODEL", "")
+        self.classify_api_endpoint = os.getenv("CLASSIFY_API_ENDPOINT", "")
         self.project_name = project_name
         
         metadata = self.rules_data.get("metadata", {})
         self.default_labels = metadata.get("default_labels", {})
         self.confidence_threshold = metadata.get("confidence_threshold", 0.6)
-        
+        self.valid_labels = []
+
         self.model = None
         self.label_encoder = None
 
@@ -103,39 +105,58 @@ class LabelClassifier:
         """Check if SiteName matches predefined source mapping"""
         if not site_name or self.project_name not in self.source_mapping:
             return None
-        
+        site_name = self._normalize_text(site_name)
         for label_type, sources in self.source_mapping[self.project_name].items():
-            if site_name in sources:
-                return label_type
+            for source in sources:
+                source = self._normalize_text(source)
+                if source in site_name or source.replace(" ", "") in site_name:
+                    return label_type
         
         return None
     
-    def _check_mini_game(self, title: str, site_name: str, buzz_type: str):
-        """Check for mini game content"""
-        kws = "mini game"
-        fanpage = ["shopee"]
-        normalized_title = self._normalize_text(title)
-        if site_name.lower() in fanpage and (kws in normalized_title or kws.replace(" ", "") in normalized_title):
-            if "group" in buzz_type.lower():
-                return "SELLER", "MINIGAME GROUP", 0.95
-            elif "page" in buzz_type.lower():
-                return "BUYER", "MINIGAME PAGE", 0.95 
-            
-        return None, None, 0
-
-    def _check_keyword(self, text: str):
-        """Check for keyword matching"""
+    def _check_keyword(self, data: Dict):
+        """Check for keyword matching with conditions"""
         project_kws = self.kws_data.get(self.project_name)
+    
         if not project_kws:
             return None, None, 0
         
+        # Extract text and metadata
+        text = self._extract_text(data)
         normalized_text = self._normalize_text(text)
         
-        for label, kws in project_kws.items():
-            for kw in kws:
-                normalized_kw = self._normalize_text(kw)
-                if normalized_kw in normalized_text:
-                    return label, "KEYWORD MATCHING", 0.95 
+        buzz_type = data.get("type", "").lower()
+        site_name = data.get("siteName", "").lower()
+        
+        # Check each label category
+        for label, rules in project_kws.items():
+            for rule in rules:
+                condition = rule.get("condition", {})
+                keywords = rule.get("keywords", [])
+                
+                # Check if conditions are met
+                conditions_met = True
+                
+                # Check type condition
+                if "type" in condition:
+                    required_type = condition["type"].lower()
+                    if required_type not in buzz_type:
+                        conditions_met = False
+                
+                # Check siteName condition
+                if "siteName" in condition:
+                    required_site = condition["siteName"].lower()
+                    # Empty string means any siteName is ok
+                    if required_site and required_site != site_name:
+                        conditions_met = False
+                
+                # If conditions are met, check keywords
+                if conditions_met:
+                    for kw in keywords:
+                        normalized_kw = self._normalize_text(kw)
+                        if normalized_kw in normalized_text:
+                            return label, "KEYWORD MATCHING", 0.95
+        
         return None, None, 0
 
     def _check_brand_indicators(self, site_name: str, buzz_type: str, author: str) -> bool:
@@ -159,6 +180,15 @@ class LabelClassifier:
         
         return None, None, 0
     
+
+    def _get_valid_labels(self) -> list:
+        
+        project_rules = self.get_project_rules()
+        for category in project_rules.get("label_categories", []):
+            self.valid_labels.append(category.get("label_type", ""))
+        return self.valid_labels
+
+
     def rule_based_classification(self, text: str) -> Optional[str]:
         """Apply rule-based classification using keywords"""
         project_rules = self.get_project_rules()
@@ -222,216 +252,177 @@ class LabelClassifier:
             print(f"Error during model prediction: {e}")
             return None, 0.0
     
-    def llm_classification(self, buzz_type: str, content: str, site_name: str = "", author: str = "") -> tuple:
-        """Use LLM to classify when rule-based fails"""
-        project_rules = self.get_project_rules()
-        if not project_rules:
-            return "Unknown", 0.0
-        
-        label_definitions = []
-        for category in project_rules.get("label_categories", []):
-            label_type = category["label_type"]
-            description = category["description"]
-            rules = category.get("rules", "")
-            examples = category.get("examples", [])
-            
-            label_def = f"{label_type}: {description}"
-            if rules:
-                label_def += f" | {rules}"
-            if examples:
-                label_def += f" | Examples: {'; '.join(examples[:2])}"
-            
-            label_definitions.append(label_def)
-        
-        context_info = ""
-        if site_name or author:
-            context_info = f"\n\nSOURCE CONTEXT:\n"
-            if site_name:
-                context_info += f"- SiteName: {site_name}\n"
-            if author:
-                context_info += f"- Author: {author}\n"
-        
-        additional_instructions = ""
-        if self.project_name == "ShopeeFood":
-            additional_instructions = """
-
-** CRITICAL CLASSIFICATION RULES **
-
-1. MERCHANT = Restaurant/shop OWNER posting about THEIR OWN business
-   ✓ Uses: "quán mình", "shop tôi", "chúc quán mình"
-   ✓ Posted from restaurant's official page
-   ✗ NOT food reviews or customer recommendations
-   
-2. USER = Customers, food bloggers, reviewers, general public
-   ✓ Food reviews with restaurant details, prices, addresses
-   ✓ Personal experiences ordering/receiving food
-   ✓ Sharing food experiences, recommendations
-   ✓ Posts about ShopeeFood campaigns from customer perspective
-   ✗ NOT from restaurant owner perspective
-   
-3. SHIPPER = Delivery drivers posting about their work
-   ✓ From driver's perspective about delivery work
-   ✓ Talking about income, orders, app issues
-   ✗ NOT just mentioning delivery in passing
-   
-4. BRAND = Official ShopeeFood marketing only
-   ✓ From official ShopeeFood VN channels
-   ✗ NOT from community pages or user posts
-
-DEFAULT: When unsure, classify as USER (not Merchant)"""
-        
-        instruction = """- Use <title>, <content>, and <description> to determine the author's perspective or intent.""" \
-            if buzz_type == "topic" else \
-        """- Use <topic> to get more context, <comment> to determine the commenter's perspective."""
-        text_format = "(<title> | <content> | <description>)" if buzz_type == "topic" else "(<topic> | <comment>)"
-        
-        prompt = f"""You are a text classification expert.
-
-Given text in format {text_format}. Your task is to assign EXACTLY ONE label to the given text.
-
-*** LABELS ***
-{chr(10).join([f"{i+1}. {ld}" for i, ld in enumerate(label_definitions)])}
-
-{context_info}
-
-*** INSTRUCTIONS ***
-
-- Select the SINGLE most appropriate label.
-- Focus on the AUTHOR'S perspective (the person writing the text).
-{instruction}
-
-{additional_instructions}
-*** CONFIDENCE SCORE ***
-Give a confidence score from 0 to 100:
-
-90-100: Very clear match  
-70-89: Strong match  
-40-69: Possible match  
-0-39: Weak or uncertain match
-
-*** OUTPUT FORMAT ***
-- ONLY return: <label>|<confidence>.
-- DO NOT include explain.
-- DO NOT include any characters.
-"""
+    async def llm_classification(self, data: dict, session: aiohttp.ClientSession) -> tuple:
+        """Use classification API endpoint with async aiohttp"""
+        if not self.classify_api_endpoint:
+            print("CLASSIFY_API_ENDPOINT not configured")
+            return self.get_default_label(), 0.0
         
         try:
             headers = {"Content-Type": "application/json"}
-            if self.llm_api_key:
-                headers["Authorization"] = f"Bearer {self.llm_api_key}"
             
-            response = requests.post(
-                f"{self.llm_api_url}/chat/completions",
+            payload = {
+                "id": data.get("id", ""),
+                "index": data.get("id", ""),
+                "topic": data.get("topic", ""),
+                "title": data.get("title", ""),
+                "content": data.get("content", ""),
+                "description": data.get("description", ""),
+                "type": data.get("type", ""),
+                "project": self.project_name.lower()
+            }
+            
+            async with session.post(
+                self.classify_api_endpoint,
                 headers=headers,
-                json={
-                    "model": self.llm_model,
-                    "messages": [
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": f"Text need to classify:\n{content}"}
-                    ],
-                    "temperature": 0.1,
-                    "max_tokens": 20,
-                    "stop": ["<think>", "\n"],
-                    "stream": False
-                },
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                raw_response = result["choices"][0]["message"]["content"].strip()
-                
-                if "<think>" in raw_response:
-                    if "</think>" in raw_response:
-                        raw_response = raw_response.split("</think>")[-1].strip()
-                    else:
-                        for valid_label in [cat["label_type"] for cat in project_rules.get("label_categories", [])]:
-                            if valid_label in raw_response:
-                                raw_response = valid_label
-                                break
-                
-                label = raw_response
-                confidence = 0.5
-                
-                if "|" in raw_response:
-                    parts = raw_response.split("|")
-                    label = parts[0].strip()
-                    try:
-                        confidence = float(parts[1].strip()) / 100.0
-                    except (ValueError, IndexError):
-                        confidence = 0.5
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    
+                    if not result.get("success", False):
+                        error_msg = result.get("error", "Unknown error")
+                        print(f"Classification API returned error: {error_msg}")
+                        return self.get_default_label(), 0.0
+                    
+                    labels = result.get("labels", [])
+                    if not labels:
+                        print("No labels returned from API")
+                        return self.get_default_label(), 0.0
+                    
+                    # Find label with level 1
+                    level1_label = None
+                    for label_obj in labels:
+                        if label_obj.get("level") == 1:
+                            level1_label = label_obj.get("name", "")
+                            break
+                    
+                    if not level1_label:
+                        print("No level 1 label found in response")
+                        return self.get_default_label(), 0.0
+                    
+                    # Default confidence for API classification
+                    confidence = 0.7
+                    
+                    # Validate against project rules if available
+                    project_rules = self.get_project_rules()
+                    if project_rules:
+                        label_lower = level1_label.lower()
+                        for valid_label in self.valid_labels:
+                            if valid_label.lower() == label_lower:
+                                return valid_label, confidence
+                            if valid_label.lower() in label_lower or label_lower in valid_label.lower():
+                                return valid_label, max(0.3, confidence - 0.2)
+                    
+                    return self.get_default_label(), confidence
                 else:
-                    label = label.strip('"\'.,;: ')
-                    label = label.split()[0] if label.split() else label
-                
-                valid_labels = [cat["label_type"] for cat in project_rules.get("label_categories", [])]
-                
-                if label in valid_labels:
-                    return label, confidence
-                
-                label_lower = label.lower()
-                for valid_label in valid_labels:
-                    if valid_label.lower() == label_lower:
-                        return valid_label, confidence
-                    if valid_label.lower() in label_lower or label_lower in valid_label.lower():
-                        return valid_label, max(0.3, confidence - 0.2)
-                
-                print(f"LLM returned invalid label '{label}', using default label")
-                return self.get_default_label(), 0.2
-            else:
-                print(f"LLM API error: {response.status_code}")
-                return self.get_default_label(), 0.0
-                
+                    print(f"Classification API error: {response.status}")
+                    return self.get_default_label(), 0.0
+                    
         except Exception as e:
-            print(f"LLM classification error: {e}")
+            print(f"Classification API error: {e}")
             return self.get_default_label(), 0.0
     
-    def classify(self, data: Dict) -> tuple:
-        """Main classification method - returns (label, method, confidence)"""
+    def classify_sync_rules(self, data: Dict) -> tuple:
+        """
+        Apply synchronous rules only (no LLM)
+        Returns (label, method, confidence) or (None, None, None) if needs LLM
+        """
         site_name = data.get("siteName", "")
         author = data.get("author", "")
-        buzz_type = data.get("type", "")
-        title = data.get("title", "")
         text = self._extract_text(data)
 
-        label, method, confidence = self._check_brand_indicators(site_name, buzz_type, author)
+        # Rule 1: Brand Indicators
+        label, method, confidence = self._check_brand_indicators(site_name, data.get("type", ""), author)
         if label and confidence > self.confidence_threshold:
             return label, method, confidence
-
-        label, method, confidence = self._check_mini_game(title, site_name, buzz_type)
-        if label and confidence > self.confidence_threshold:
-            return label, method, confidence
-
-        label, method, confidence = self._check_keyword(text)
-        if label and confidence > self.confidence_threshold:
-            return label, method, confidence
-
+        
+        # Rule 2: SiteName Mapping
         if site_name:
             label = self._check_sitename(site_name)
             if label:
                 return label, "SITE NAME", 0.95
-              
+        
+        # Rule 3: Keyword Matching
+        label, method, confidence = self._check_keyword(data)
+        if label and confidence > self.confidence_threshold:
+            return label, method, confidence
+
+        # Rule 4: Empty text check
         if not text:
             return self.get_default_label(), "NoText", 0.0
-            
+        
+        # Rule 5: Rule-based Classification
         label = self.rule_based_classification(text)
         if label is not None:
             return label, "RuleBased", 0.8
         
-        label, confidence = self.llm_classification(buzz_type, text, site_name, author)
+        # Rule 6: Model-based Classification (if available)
+        # if self.model is not None:
+        #     label, confidence = self.model_based_classification(text)
+        #     if confidence >= self.confidence_threshold:
+        #         return label, "PretrainedModel", confidence
+        
+        # Needs LLM
+        return None, None, None
+    
+    async def classify_async(self, data: Dict, session: aiohttp.ClientSession) -> tuple:
+        """Async classification method - returns (label, method, confidence)"""
+        # Try sync rules first
+        label, method, confidence = self.classify_sync_rules(data)
+        if label is not None:
+            return label, method, confidence
+        
+        # Need LLM classification
+        label, confidence = await self.llm_classification(data, session)
         if label is not None and confidence >= self.confidence_threshold:
             return label, "LLM", confidence
         
+        # Fallback to model with low confidence
+        text = self._extract_text(data)
         label, confidence = self.model_based_classification(text)
-        if confidence < self.confidence_threshold:
-            default_label = self.get_default_label()
-            return default_label, "LowConfidence", confidence
+        if label is not None:
+            return label, "LowConfidence", confidence
         
-        return label, "PretrainedModel", confidence
+        return self.get_default_label(), "LowConfidence", 0.0
+    
+    def classify(self, data: Dict) -> tuple:
+        """Synchronous wrapper for classify_async (for backward compatibility)"""
+        async def _classify():
+            async with aiohttp.ClientSession() as session:
+                return await self.classify_async(data, session)
+        
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        return loop.run_until_complete(_classify())
 
 
-def classify_category(df: pd.DataFrame, project_name: str, max_workers: int = 10):
-    """Classify dataframe rows using multi-threading"""
+async def classify_batch_async(classifier: LabelClassifier, rows_data: List[Tuple], session: aiohttp.ClientSession) -> List[Tuple]:
+    """Classify a batch of rows asynchronously"""
+    tasks = []
+    for idx, data in rows_data:
+        task = classifier.classify_async(data, session)
+        tasks.append((idx, task))
+    
+    results = []
+    for idx, task in tasks:
+        try:
+            label, method, confidence = await task
+            results.append((idx, label, method, confidence))
+        except Exception as e:
+            print(f"\nError processing row {idx}: {e}")
+            results.append((idx, "Unknown", "Error", 0.0))
+    
+    return results
+
+
+def classify_category(df: pd.DataFrame, project_name: str, batch_size: int = 10):
+    """Classify dataframe rows - sync rules first, then batch LLM processing"""
     required_columns = ['Id', 'Topic', 'Title', 'Content', 'Description', 'Type', 'SiteName', 'Author']
     missing_columns = [col for col in required_columns if col not in df.columns]
 
@@ -442,10 +433,14 @@ def classify_category(df: pd.DataFrame, project_name: str, max_workers: int = 10
     print("Đang khởi tạo classifier...")
     classifier = LabelClassifier(project_name=project_name)
     classifier.load_pretrained_model()
-
-    def classify_row(row):
+    classifier._get_valid_labels()
+    # Prepare data
+    rows_data = []
+    for row in df.itertuples():
         idx = row.Index
         data = {
+            "id": str(getattr(row, "Id", "")) if pd.notna(getattr(row, "Id", "")) else "",
+            "topic": str(getattr(row, "Topic", "")) if pd.notna(getattr(row, "Topic", "")) else "",
             "title": str(getattr(row, "Title", "")) if pd.notna(getattr(row, "Title", "")) else "",
             "content": str(getattr(row, "Content", "")) if pd.notna(getattr(row, "Content", "")) else "",
             "description": str(getattr(row, "Description", "")) if pd.notna(getattr(row, "Description", "")) else "",
@@ -453,33 +448,53 @@ def classify_category(df: pd.DataFrame, project_name: str, max_workers: int = 10
             "siteName": str(getattr(row, "SiteName", "")) if pd.notna(getattr(row, "SiteName", "")) else "",
             "author": str(getattr(row, "Author", "")) if pd.notna(getattr(row, "Author", "")) else "",
         }
-        label, method, confidence = classifier.classify(data)
-        return idx, label, method, confidence
+        rows_data.append((idx, data))
 
-    print(f"Đang phân loại với {max_workers} workers...")
     results = [None] * len(df)
+    rows_needing_llm = []
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(classify_row, row): row.Index
-            for row in df.itertuples()
-        }
+    # Phase 1: Apply sync rules to all rows
+    print(f"Phase 1: Applying sync rules to {len(rows_data)} rows...")
+    with tqdm(total=len(rows_data), desc="Sync Rules") as pbar:
+        for idx, data in rows_data:
+            label, method, confidence = classifier.classify_sync_rules(data)
+            if label is not None:
+                results[idx] = (label, method, confidence)
+            else:
+                rows_needing_llm.append((idx, data))
+            pbar.update(1)
 
-        with tqdm(total=len(df), desc="Processing") as pbar:
-            for future in as_completed(futures):
-                try:
-                    idx, label, method, confidence = future.result()
-                    results[idx] = (label, method, confidence)
-                except Exception as e:
-                    idx = futures[future]
-                    print(f"\nError processing row {idx}: {e}")
-                    results[idx] = ("Unknown", "Error", 0.0)
-                pbar.update(1)
+    # Phase 2: Batch process rows needing LLM
+    if rows_needing_llm:
+        print(f"\nPhase 2: Processing {len(rows_needing_llm)} rows with LLM (batch size {batch_size})...")
+        
+        async def process_llm_batches():
+            async with aiohttp.ClientSession() as session:
+                with tqdm(total=len(rows_needing_llm), desc="LLM Processing") as pbar:
+                    for i in range(0, len(rows_needing_llm), batch_size):
+                        batch = rows_needing_llm[i:i+batch_size]
+                        batch_results = await classify_batch_async(classifier, batch, session)
+                        
+                        for idx, label, method, confidence in batch_results:
+                            results[idx] = (label, method, confidence)
+                        
+                        pbar.update(len(batch))
+        
+        # Run async processing
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        loop.run_until_complete(process_llm_batches())
+    else:
+        print("\nNo rows need LLM processing!")
 
     labels, methods, confidences = zip(*results)
     df['Label'] = labels
-    # df['Method'] = methods
-    # df['Confidence'] = confidences
+    df['Method'] = methods
+    df['Confidence'] = confidences
     df = sanitize_excel_values(df)
 
     return df
