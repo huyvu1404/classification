@@ -4,7 +4,6 @@ import numpy as np
 import os
 import unicodedata
 import asyncio
-import nest_asyncio
 from typing import Dict, List, Optional, Tuple
 import aiohttp
 from tqdm import tqdm
@@ -15,7 +14,6 @@ from src.settings import PROJECT_DIR
 from src.utils import sanitize_excel_values
 
 load_dotenv()
-nest_asyncio.apply()
 
 LLM_RULES_PATH = os.path.join(PROJECT_DIR, "src/rules/llm-rules.json")
 LABEL_RULE_PATH = os.path.join(PROJECT_DIR, "src/rules/label-rules.json")
@@ -55,6 +53,7 @@ class LabelClassifier:
         title = data.get("title", "").strip()
         content = data.get("content", "").strip()
         description = data.get("description", "").strip()
+
         parts = []
         if title:
             parts.append(title)
@@ -71,12 +70,14 @@ class LabelClassifier:
 
     def _get_valid_labels(self) -> List[str]:
         if not self.valid_labels:
-            self.valid_labels = list(self.kws_data.get(self.project_name, {}).keys())
+            project_kws = self.kws_data.get(self.project_name, {})
+            self.valid_labels = list(project_kws.keys())
         return self.valid_labels
 
     # ── Rule matching ─────────────────────────────────────────────────────────
 
     def _check_site_rules(self, data: Dict) -> Tuple[Optional[str], Optional[str], float]:
+        """Match by siteId / siteName / channel / label field (flat rule format)."""
         project_kws = self.kws_data.get(self.project_name)
         if not project_kws:
             return None, None, 0
@@ -108,6 +109,7 @@ class LabelClassifier:
         return None, None, 0
 
     def _check_keyword(self, data: Dict) -> Tuple[Optional[str], Optional[str], float]:
+        """Match by keyword rules with optional type/siteName conditions."""
         project_kws = self.kws_data.get(self.project_name)
         if not project_kws:
             return None, None, 0
@@ -232,6 +234,7 @@ class LabelClassifier:
     # ── Classification pipeline ───────────────────────────────────────────────
 
     def classify_sync_rules(self, data: Dict) -> Tuple[Optional[str], Optional[str], Optional[float]]:
+        """Returns (label, method, confidence) or (None, None, None) if LLM needed."""
         text = self._extract_text(data)
 
         label, method, conf = self._check_site_rules(data)
@@ -271,10 +274,28 @@ class LabelClassifier:
         async def _run():
             async with aiohttp.ClientSession() as session:
                 return await self.classify_async(data, session)
-        return asyncio.get_event_loop().run_until_complete(_run())
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        return loop.run_until_complete(_run())
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Batch helpers ─────────────────────────────────────────────────────────────
+
+async def _classify_batch(classifier: LabelClassifier, batch: List[Tuple], session: aiohttp.ClientSession) -> List[Tuple]:
+    results = []
+    for idx, data in batch:
+        try:
+            label, method, conf = await classifier.classify_async(data, session)
+            results.append((idx, label, method, conf))
+        except Exception as e:
+            print(f"Error on row {idx}: {e}")
+            results.append((idx, "Unknown", "Error", 0.0))
+    return results
+
 
 def _row_to_dict(row) -> Dict:
     def safe(col):
@@ -290,13 +311,19 @@ def _row_to_dict(row) -> Dict:
     }
 
 
+import asyncio
+import aiohttp
+from typing import List, Optional, Tuple
+import pandas as pd
+from tqdm import tqdm
+
 async def classify_category(
     df: pd.DataFrame,
     project_name: str,
     batch_size: int = 10,
-    max_concurrent: int = 10,
+    max_concurrent: int = 10         
 ) -> pd.DataFrame:
-    """Two-phase: sync rules first, then concurrent LLM batches."""
+    """Two-phase classification: sync rules first, then batch LLM for remaining rows with controlled concurrency."""
     required = ["Id", "Title", "Content", "Description", "Type", "SiteName"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -306,12 +333,11 @@ async def classify_category(
     classifier.load_pretrained_model()
     classifier._get_valid_labels()
 
-    # Use df index as key to guarantee correct row assignment
     rows_data = [(row.Index, _row_to_dict(row)) for row in df.itertuples()]
-    results: Dict[int, Tuple] = {}
-    needs_llm: List[Tuple] = []
+    results: List[Optional[Tuple]] = [None] * len(df)
+    needs_llm = []
 
-    # Phase 1: sync rules
+    # Phase 1: sync rules (giữ nguyên)
     print(f"Phase 1: sync rules on {len(rows_data)} rows...")
     for idx, data in tqdm(rows_data, desc="Sync Rules"):
         label, method, conf = classifier.classify_sync_rules(data)
@@ -320,44 +346,47 @@ async def classify_category(
         else:
             needs_llm.append((idx, data))
 
-    # Phase 2: concurrent LLM
+    # Phase 2: LLM với semaphore giới hạn concurrency
     if needs_llm:
-        print(f"Phase 2: LLM on {len(needs_llm)} rows (batch={batch_size}, concurrent={max_concurrent})...")
-
-        async def process_batch(batch: List[Tuple], session: aiohttp.ClientSession) -> List[Tuple]:
-            out = []
-            for idx, data in batch:
-                try:
-                    label, method, conf = await classifier.classify_async(data, session)
-                    out.append((idx, label, method, conf))
-                except Exception as e:
-                    print(f"Error on row {idx}: {e}")
-                    out.append((idx, classifier.get_default_label(), "Error", 0.0))
-            return out
-
-        semaphore = asyncio.Semaphore(max_concurrent)
+        print(f"Phase 2: LLM on {len(needs_llm)} rows (batch={batch_size}, max_concurrent={max_concurrent})...")
 
         async def run_llm():
+            semaphore = asyncio.Semaphore(max_concurrent)
+
+            async def classify_with_limit(batch):
+                async with semaphore:
+                    return await _classify_batch(classifier, batch, session)
+
             async with aiohttp.ClientSession() as session:
-                batches = [needs_llm[i:i + batch_size] for i in range(0, len(needs_llm), batch_size)]
+                # Tạo tất cả các task cho từng batch
+                tasks = []
+                for i in range(0, len(needs_llm), batch_size):
+                    batch = needs_llm[i:i + batch_size]
+                    tasks.append(classify_with_limit(batch))
 
-                async def limited(batch):
-                    async with semaphore:
-                        return await process_batch(batch, session)
-
+                # Chạy tất cả task với as_completed để cập nhật tiến trình dần dần
                 with tqdm(total=len(needs_llm), desc="LLM") as pbar:
-                    for coro in asyncio.as_completed([limited(b) for b in batches]):
-                        for idx, label, method, conf in await coro:
+                    for coro in asyncio.as_completed(tasks):
+                        batch_results = await coro
+                        for idx, label, method, conf in batch_results:
                             results[idx] = (label, method, conf)
-                            pbar.update(1)
+                        pbar.update(len(batch_results))  # update theo số item thực tế trong batch
 
-        await run_llm()
+        # Chạy async function
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        loop.run_until_complete(run_llm())
+
     else:
         print("No rows need LLM.")
 
-    # Assign back using df index — guaranteed correct mapping
+    labels, methods, confs = zip(*[r if r is not None else (None, "none", 0.0) for r in results])
     df = df.copy()
-    df["Label"] = df.index.map(lambda i: results[i][0])
-    df["Method"] = df.index.map(lambda i: results[i][1])
-    df["Confidence"] = df.index.map(lambda i: results[i][2])
+    df["Label"] = labels
+    # df["Method"] = methods
+    # df["Confidence"] = confs
     return sanitize_excel_values(df)
