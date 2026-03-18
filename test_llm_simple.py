@@ -1,134 +1,132 @@
 """
 Simple test script for LLM call
-Quick test to verify LLM API is working
+Quick test to verify LLM API is working with parallel requests
 """
 import asyncio
 import aiohttp
 import os
+import json
+import pandas as pd
 from dotenv import load_dotenv
 
 load_dotenv()
-from src.detector import Detector
 
-async def test_simple_llm_call():
-    """Test a simple LLM API call"""
-    
-#     # Get config from .env
-#     llm_api_url = os.getenv("LLM_API_URL", "")
-#     llm_api_key = os.getenv("LLM_API_KEY", "")
-#     llm_model = os.getenv("LLM_MODEL", "gpt-3.5-turbo")
-    
-#     print("=" * 60)
-#     print("Simple LLM API Test")
-#     print("=" * 60)
-#     print(f"API URL: {llm_api_url}")
-#     print(f"Model: {llm_model}")
-#     print(f"API Key: {'Set' if llm_api_key else 'Not set'}")
-#     print()
-    
-#     if not llm_api_url:
-#         print("❌ Error: LLM_API_URL not configured")
-#         print("\nPlease add to .env file:")
-#         print("  LLM_API_URL=https://your-api-url.com/v1")
-#         print("  LLM_API_KEY=your_api_key (optional)")
-#         print("  LLM_MODEL=gpt-3.5-turbo")
-#         return
-    
-#     # Simple test prompt
-    test_prompt = """<|im_start|>system
-Bạn là một chuyên gia phân loại nội dung.
+BATCH_SIZE = 10
 
-Nhiệm vụ của bạn là kiểm tra xem trong nội dung bình luận của người dùng có nhắc đến hoặc tag tên của một người khác hay không.
+test_prompt = """<|im_start|>system
+Bạn là chuyên gia phân loại hành vi người dùng trên các cộng đồng thương mại điện tử Việt Nam. Nhiệm vụ: Xác định người đăng bài/comment là **SELLER** (người bán, chủ shop, đang kinh doanh) hay **BUYER** (người mua, người tiêu dùng thông thường).
 
-*** QUY TẮC PHÂN TÍCH ***
+### Nguyên tắc cốt lõi (ưu tiên tuyệt đối):
+- SELLER: Góc nhìn từ phía **cung cấp sản phẩm/dịch vụ**, vận hành gian hàng, bán hàng.
+- BUYER: Góc nhìn từ phía **tiêu dùng**, tìm mua, trải nghiệm mua sắm.
 
-1. Các trường hợp được xem là **Yes**:
-- Có ký hiệu @ trước tên hoặc username
-   Ví dụ:
-   + "@huy.vu cái này hay nè"
-   + "xem cái này nè @minh.nguyen"
+### Quy tắc đặc biệt cho MINIGAME:
+→ **SELLER** nếu đăng trong **GROUP BÁN HÀNG rõ ràng** (tên group BẮT BUỘC chứa từ khóa liên quan tới bán hàng, kinh doanh, lập nghiệp, con buôn, seller, hội bán hàng... Ví dụ: Tâm sự con buôn, Hội seller Shopee, Lập nghiệp Shopee, Bán hàng với Shopee, Chia sẻ kinh nghiệm bán hàng).
+  → **BUYER** nếu đăng trên **fanpage chính thức của Shopee** (ShopeeVN, Shopee, ShopeeOfficial, ShopeePayVN, ShopeeFoodVN...).
+  → **BUYER** nếu đăng trong các group hỗ trợ game như "GIÚP TƯỚI CÂY SHOPEE", "NÔNG TRẠI SHOPEE", "SĂN XU SHOPEE", "Chơi game Shopee", "Tưới cây Shopee"... (nhóm này là cộng đồng người chơi săn xu, không phải bán hàng).
+  → Nếu không thuộc các trường hợp trên → quay về phân tích content theo các dấu hiệu dưới.
 
-- Có chứa tên, biệt danh:
-   Ví dụ:
-   + "Huy Vu cái này hay nè"
-   + "Nguyen Minh xem thử"
-   + "Ly Ly"
-   + "Ngày mai đi thử Huy Vu"
+### Dấu hiệu mạnh → SELLER:
+- Giới thiệu, quảng cáo sản phẩm đang bán, link shop, "shop bên mình", "inbox để đặt hàng", "add Zalo".
+- Quản lý shop: doanh số, phí sàn, hoàn hàng (góc shop), chạy ads, decor shop, up ảnh sản phẩm.
+- Khiếu nại từ góc shop: đơn bị huỷ oan, vận chuyển thiệt hại cho shop.
+- Đăng trong group bán hàng rõ ràng.
 
-2. Các trường hợp được xem là **No**:
-- Nội dung không chứa username hoặc tên người cụ thể
-- Nội dung chỉ chứa tên của tổ chức, công ty, doanh nghiệp, địa phương
+### Dấu hiệu mạnh → BUYER:
+- Review, Seeding sản phẩm.
+- Chương trình sale, giảm giá, deal hot trên các sàn thương mại điện tử.
+- Hỏi mua, săn deal, xin link, than chất lượng, khoe deal săn được, "mới nhận hàng", "ship chậm quá".
+- Khiếu nại từ góc người mua: hoàn tiền khó, hàng lỗi, shop lừa.
+- Chia sẻ mã giảm giá chung, kinh nghiệm dùng app như người dùng.
+- Đăng trong group buyer rõ ràng (Nghiện Shopee, Hội săn sale...).
 
+### Các vùng giao thoa (xử lý sau minigame):
+- Khiếu nại vận chuyển/hoàn hàng: "shop bị thiệt" → SELLER; "mình bị mất hàng/hoàn mãi không được" → BUYER.
+- Affiliate/Shopee Video/KOL: thường BUYER (trừ khi rõ ràng quản lý shop + affiliate).
+- Comment trong topic bán hàng: hỏi mua/tư vấn → BUYER; chia sẻ kinh nghiệm bán → SELLER.
 
-*** ĐỊNH DẠNG ĐẦU RA ***
-- Chỉ trả về đúng một dòng duy nhất chứa Yes hoặc No
-- KHÔNG lặp lại yêu cầu
-- KHÔNG giải thích lí do
-- KHÔNG chứa bất kì kí tự nào khác
-
+### Định dạng đầu ra (TUYỆT ĐỐI):
+- CHỈ trả về đúng 1 dòng: SELLER hoặc BUYER
+- KHÔNG giải thích
+- KHÔNG tự suy diễn mà phải dựa vào dữ liệu được cung cấp
+- KHÔNG thêm bất kỳ nội dung nào khác.
 <|im_end|>
 <|im_start|>user
-Nội dung bình luận cần phân tích:
-{comment}
+Dữ liệu JSON:
+{data}
 """
-#     print(f"Test Prompt: {test_prompt}")
-#     print("\nCalling LLM API...")
-    
-#     try:
-#         headers = {
-#             "Content-Type": "application/json"
-#         }
-        
-#         if llm_api_key:
-#             headers["Authorization"] = f"Bearer {llm_api_key}"
-        
-#         payload = {
-#             "model": llm_model,
-#             "messages": [
+
+
+def row_to_json(row):
+    buzz_type = "comment" if "comment" in row["Type"].lower() else "topic"
+    data = {
+        "type": buzz_type,
+        "title": row["Title"],
+        "content": row["Content"],
+        "description": row["Description"],
+        "siteName": row["SiteName"]
+    }
+    return json.dumps(data, ensure_ascii=False, indent=4)
+
+
+async def call_llm(session: aiohttp.ClientSession, json_str: str) -> tuple:
+    """Call LLM API for a single row, returns (label, explain)"""
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "model": os.getenv("MODEL_NAME"),
+        "messages": [
+            {"role": "user", "content": test_prompt.format(data=json_str)}
+        ],
+        "temperature": 0.1,
+        "max_tokens": 150,
+        "stream": False
+    }
+
+    try:
+        async with session.post(
+            f"{os.getenv('LLM_API_URL')}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as response:
+            if response.status == 200:
+                result = await response.json()
+                label = result["choices"][0]["message"]["content"].strip()
+
                 
-#                 {"role": "user", "content": test_prompt.format(comment="Bảo Bảo ")}
-#             ],
-#             "temperature": 0.1,
-#             "max_tokens": 10,
-#             "stream": False
-#         }
-        
-#         async with aiohttp.ClientSession() as session:
-#             async with session.post(
-#                 f"{llm_api_url}/chat/completions",
-#                 headers=headers,
-#                 json=payload,
-#                 timeout=aiohttp.ClientTimeout(total=30)
-#             ) as response:
-#                 print(f"Status Code: {response.status}")
-                
-#                 if response.status == 200:
-#                     result = await response.json()
-#                     answer = result["choices"][0]["message"]["content"]
-                    
-#                     print(f"\n✓ Success!")
-#                     print(f"Response: {answer}")
-#                     print(f"\nFull response:")
-#                     print(result)
-#                 else:
-#                     error_text = await response.text()
-#                     print(f"\n❌ Error: Status {response.status}")
-#                     print(f"Response: {error_text}")
-                    
-#     except aiohttp.ClientError as e:
-#         print(f"\n❌ Network Error: {e}")
-#     except Exception as e:
-#         print(f"\n❌ Error: {e}")
-#         import traceback
-#         traceback.print_exc()
-    detector = Detector()
-    comment = "SuSu"
+                return label
+            else:
+                print(f"Error: status {response.status}")
+                return ""
+    except Exception as e:
+        print(f"Error: {e}")
+        return ""
+
+
+async def test_simple_llm_call():
+    df = pd.read_excel("/Users/huyvu/Downloads/Seller Buyer Project Shopee (1).xlsx")
+    df = df.reset_index(drop=True)  # ensure positional index matches row order
+
+    # Pre-allocate results aligned to df index
+    results = [""] * len(df)
+
     async with aiohttp.ClientSession() as session:
-        res = await detector._detect_name_tags_llm(comment, session)
-        print(res)
-        print("++++++++++")
-        # print("Test 2:", test_prompt.format(comment=comment))
-        res2 = await detector._call_llm(prompt=test_prompt.format(comment=comment), session=session)
-        print(res2)
+        for i in range(0, len(df), BATCH_SIZE):
+            batch = df.iloc[i:i + BATCH_SIZE]
+            # Pair each task with its absolute position in df
+            indexed_rows = [(pos, row) for pos, (_, row) in enumerate(batch.iterrows(), start=i)]
+            tasks = [call_llm(session, row_to_json(row)) for _, row in indexed_rows]
+            batch_results = await asyncio.gather(*tasks)
+
+            for (pos, _), label in zip(indexed_rows, batch_results):
+                results[pos] = label
+
+            print(f"Processed {min(i + BATCH_SIZE, len(df))}/{len(df)} rows")
+
+    df["llm_label"] = results
+    df.to_excel("test.xlsx", index=False)
+    print("Done. Saved to test.xlsx")
+
+
 if __name__ == "__main__":
     asyncio.run(test_simple_llm_call())

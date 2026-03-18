@@ -22,3 +22,6 @@ auth/
 data/
 
 init/
+
+test/
+test*

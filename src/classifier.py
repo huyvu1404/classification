@@ -4,6 +4,7 @@ import numpy as np
 import os
 import unicodedata
 import asyncio
+import nest_asyncio
 from typing import Dict, List, Optional, Tuple
 import aiohttp
 from tqdm import tqdm
@@ -11,490 +12,352 @@ import pandas as pd
 from dotenv import load_dotenv
 from src.models import loader
 from src.settings import PROJECT_DIR
-from src.utils import sanitize_excel_values, clean_lower_text
+from src.utils import sanitize_excel_values
 
 load_dotenv()
+nest_asyncio.apply()
 
 LLM_RULES_PATH = os.path.join(PROJECT_DIR, "src/rules/llm-rules.json")
-KEYWORD_PATH = os.path.join(PROJECT_DIR, "src/rules/label-kws.json")
-SOURCE_MAPPING_PATH = os.path.join(PROJECT_DIR, "src/rules/source-mapping.json")
+LABEL_RULE_PATH = os.path.join(PROJECT_DIR, "src/rules/label-rules.json")
+
 
 class LabelClassifier:
-    def __init__(self, project_name: str = "ShopeeFood", llm_rules_path: str = LLM_RULES_PATH, kws_path: str = KEYWORD_PATH, source_mapping_path: str = SOURCE_MAPPING_PATH):
-        """Initialize classifier with rules from JSON file"""
-        with open(llm_rules_path, 'r', encoding='utf-8') as f:
-            self.rules_data = json.load(f)
-        with open(kws_path, 'r', encoding='utf-8') as f:
+    def __init__(self, project_name: str = "ShopeeFood", llm_rules_path: str = LLM_RULES_PATH, label_rule_path: str = LABEL_RULE_PATH):
+        with open(llm_rules_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f).get("metadata", {})
+        with open(label_rule_path, "r", encoding="utf-8") as f:
             self.kws_data = json.load(f)
-        
-        try:
-            with open(source_mapping_path, 'r', encoding='utf-8') as f:
-                self.source_mapping = json.load(f)
-        except FileNotFoundError:
-            self.source_mapping = {}
-        
+
+        self.project_name = project_name
+        self.default_labels = metadata.get("default_labels", {})
+        self.confidence_threshold = metadata.get("confidence_threshold", 0.6)
+        self.valid_labels: List[str] = []
+
         self.llm_api_url = os.getenv("LLM_API_URL", "")
         self.llm_api_key = os.getenv("LLM_API_KEY", "")
         self.llm_model = os.getenv("LLM_MODEL", "")
-        self.classify_api_endpoint = os.getenv("CLASSIFY_API_ENDPOINT", "")
-        self.project_name = project_name
-        
-        metadata = self.rules_data.get("metadata", {})
-        self.default_labels = metadata.get("default_labels", {})
-        self.confidence_threshold = metadata.get("confidence_threshold", 0.6)
-        self.valid_labels = []
 
         self.model = None
         self.label_encoder = None
 
+    # ── Text helpers ──────────────────────────────────────────────────────────
+
     def _normalize_text(self, text: str) -> str:
-        """Normalize text: convert Unicode variants to normal, remove URLs, keep Vietnamese tones, remove punctuation, lowercase"""
         if not text or pd.isna(text):
             return ""
-        
-        text = str(text)
-        
-        # Normalize Unicode: convert bold, italic, and other variants to normal characters
-        text = unicodedata.normalize('NFKD', text)
-        
-        # Remove URLs
-        text = re.sub(r'https?://\S+', '', text)
-        
-        # Remove punctuation but keep Vietnamese characters with tones
-        text = re.sub(r'[!?.,;:\"\'\(\)\[\]\{\}\/\\\|@#\$%\^\&\*\+=\-_~`<>]', ' ', text)
-        
-        # Normalize whitespace and convert to lowercase
+        text = unicodedata.normalize("NFKD", str(text))
+        text = re.sub(r"https?://\S+", "", text)
+        text = re.sub(r'[!?.,;:\"\'\(\)\[\]\{\}\/\\\|@#\$%\^\&\*\+=\-_~`<>]', " ", text)
         return re.sub(r"\s+", " ", text).lower().strip()
-    
+
     def _extract_text(self, data: Dict) -> str:
-        """Extract and merge text from title, content, description"""
-        text_parts = []
-        
         is_topic = "topic" in data.get("type", "").lower()
         title = data.get("title", "").strip()
         content = data.get("content", "").strip()
         description = data.get("description", "").strip()
-        
-        if is_topic:
-            if title:
-                text_parts.append(title)
-            if content and content != title:
-                text_parts.append(content)
-            if description and description not in [title, content]:
-                text_parts.append(description)
-        else:
-            if title:
-                text_parts.append(title)
-            if content and content != title:
-                text_parts.append(content)
+        parts = []
+        if title:
+            parts.append(title)
+        if content and content != title:
+            parts.append(content)
+        if is_topic and description and description not in (title, content):
+            parts.append(description)
+        return " | ".join(parts)
 
-        return " | ".join(text_parts)
-    
+    # ── Label helpers ─────────────────────────────────────────────────────────
+
     def get_default_label(self) -> str:
-        """Get default label for project when confidence is low"""
         return self.default_labels.get(self.project_name, "Unknown")
-    
-    def get_project_rules(self) -> Optional[Dict]:
-        """Get rules for specific project"""
-        for project in self.rules_data.get("projects", []):
-            if project["project_name"] == self.project_name:
-                return project
-        return None
-    
-    def _check_sitename(self, site_name: str) -> Optional[str]:
-        """Check if SiteName matches predefined source mapping"""
-        if not site_name or self.project_name not in self.source_mapping:
-            return None
-        site_name = self._normalize_text(site_name)
-        for label_type, sources in self.source_mapping[self.project_name].items():
-            for source in sources:
-                source = self._normalize_text(source)
-                if source in site_name or source.replace(" ", "") in site_name:
-                    return label_type
-        
-        return None
-    
-    def _check_keyword(self, data: Dict):
-        """Check for keyword matching with conditions"""
-        project_kws = self.kws_data.get(self.project_name)
-    
-        if not project_kws:
-            return None, None, 0
-        
-        # Extract text and metadata
-        text = self._extract_text(data)
-        normalized_text = self._normalize_text(text)
-        
-        buzz_type = data.get("type", "").lower()
-        site_name = data.get("siteName", "").lower()
-        
-        # Check each label category
-        for label, rules in project_kws.items():
-            for rule in rules:
-                condition = rule.get("condition", {})
-                keywords = rule.get("keywords", [])
-                
-                # Check if conditions are met
-                conditions_met = True
-                
-                # Check type condition
-                if "type" in condition:
-                    required_type = condition["type"].lower()
-                    if required_type not in buzz_type:
-                        conditions_met = False
-                
-                # Check siteName condition
-                if "siteName" in condition:
-                    required_site = condition["siteName"].lower()
-                    # Empty string means any siteName is ok
-                    if required_site and required_site != site_name:
-                        conditions_met = False
-                
-                # If conditions are met, check keywords
-                if conditions_met:
-                    for kw in keywords:
-                        normalized_kw = self._normalize_text(kw)
-                        if normalized_kw in normalized_text:
-                            return label, "KEYWORD MATCHING", 0.95
-        
-        return None, None, 0
 
-    def _check_brand_indicators(self, site_name: str, buzz_type: str, author: str) -> bool:
-        """Check if content is from official brand channels"""
-        if "topic" in clean_lower_text(buzz_type):
-            brand_indicators = [
-                "ShopeeFood VN",
-                "ShopeeFood Vietnam"
-            ]
-            
-            site_name_lower = clean_lower_text(site_name)
-            author_lower = clean_lower_text(author)
-            
-            for indicator in brand_indicators:
-                indicator_lower = clean_lower_text(indicator)
-                if (site_name_lower == indicator_lower or 
-                    author_lower == indicator_lower or
-                    site_name_lower.startswith(indicator_lower + " ") or
-                    author_lower.startswith(indicator_lower + " ")):
-                    return "Brand", "BrandIndicator", 1.0
-        
-        return None, None, 0
-    
-
-    def _get_valid_labels(self) -> list:
-        
-        project_rules = self.get_project_rules()
-        for category in project_rules.get("label_categories", []):
-            self.valid_labels.append(category.get("label_type", ""))
+    def _get_valid_labels(self) -> List[str]:
+        if not self.valid_labels:
+            self.valid_labels = list(self.kws_data.get(self.project_name, {}).keys())
         return self.valid_labels
 
+    # ── Rule matching ─────────────────────────────────────────────────────────
 
-    def rule_based_classification(self, text: str) -> Optional[str]:
-        """Apply rule-based classification using keywords"""
-        project_rules = self.get_project_rules()
-        if not project_rules:
-            return None
-        
-        normalized_text = self._normalize_text(text)
-        best_match = None
-        max_keyword_count = 0
-        
-        for category in project_rules.get("label_categories", []):
-            keywords = category.get("keywords", [])
-            if not keywords:
-                continue
-            
-            keyword_count = sum(1 for keyword in keywords if self._normalize_text(keyword) in normalized_text)
-            
-            if keyword_count > max_keyword_count:
-                max_keyword_count = keyword_count
-                best_match = category["label_type"]
-        
-        if max_keyword_count >= 2:
-            return best_match
-        
-        return None
-    
-    def load_pretrained_model(self) -> Tuple[Optional[object], Optional[object]]:
-        """Load pretrained model and label encoder for a project"""
+    def _check_site_rules(self, data: Dict) -> Tuple[Optional[str], Optional[str], float]:
+        project_kws = self.kws_data.get(self.project_name)
+        if not project_kws:
+            return None, None, 0
+
+        site_id = str(data.get("siteId", "")).strip()
+        site_name = self._normalize_text(data.get("siteName", ""))
+        channel = self._normalize_text(data.get("channel", ""))
+        label_field = self._normalize_text(data.get("label", ""))
+
+        for label, rules in project_kws.items():
+            for rule in rules if isinstance(rules, list) else [rules]:
+                if "condition" in rule or "keywords" in rule:
+                    continue
+                for sid in rule.get("siteId", []):
+                    if site_id and site_id == str(sid).strip():
+                        return label, "SITE ID", 0.95
+                for sn in rule.get("siteName", []):
+                    nsn = self._normalize_text(sn)
+                    if nsn and (nsn in site_name or site_name in nsn):
+                        return label, "SITE NAME", 0.95
+                for ch in rule.get("channels", []):
+                    nch = self._normalize_text(ch)
+                    if nch and nch in channel:
+                        return label, "CHANNEL", 0.95
+                for lb in rule.get("labels", []):
+                    nlb = self._normalize_text(lb)
+                    if nlb and nlb in label_field:
+                        return label, "LABEL FIELD", 0.95
+        return None, None, 0
+
+    def _check_keyword(self, data: Dict) -> Tuple[Optional[str], Optional[str], float]:
+        project_kws = self.kws_data.get(self.project_name)
+        if not project_kws:
+            return None, None, 0
+
+        normalized_text = self._normalize_text(self._extract_text(data))
+        buzz_type = data.get("type", "").lower()
+        site_name = data.get("siteName", "").lower()
+
+        for label, rules in project_kws.items():
+            for rule in rules if isinstance(rules, list) else [rules]:
+                keywords = rule.get("keywords", [])
+                if not keywords:
+                    continue
+                condition = rule.get("condition", {})
+                if "type" in condition and condition["type"].lower() not in buzz_type:
+                    continue
+                if "siteName" in condition:
+                    req = condition["siteName"].lower()
+                    if req and req != site_name:
+                        continue
+                for kw in keywords:
+                    if self._normalize_text(kw) in normalized_text:
+                        return label, "KEYWORD MATCHING", 0.95
+        return None, None, 0
+
+    # ── Model ─────────────────────────────────────────────────────────────────
+
+    def load_pretrained_model(self):
         try:
-            model, label_encoder = loader(self.project_name)
-            self.model = model
-            self.label_encoder = label_encoder
-            print(f"Loaded pretrained model for project: {self.project_name}")
-        except FileNotFoundError as e:
-            print(f"No pretrained model found for project {self.project_name}: {e}")
+            self.model, self.label_encoder = loader(self.project_name)
         except Exception as e:
-            print(f"Error loading pretrained model for {self.project_name}: {e}")
+            print(f"Could not load pretrained model for {self.project_name}: {e}")
 
     def model_based_classification(self, text: str) -> Tuple[Optional[str], float]:
-        """Use pretrained model for classification"""
         if self.model is None or self.label_encoder is None:
             return None, 0.0
-
         try:
-            normalized_text = self._normalize_text(text)
-            prediction = self.model.predict([normalized_text])[0]
+            normalized = self._normalize_text(text)
+            prediction = self.model.predict([normalized])[0]
             confidence = 0.0
-
             if hasattr(self.model, "decision_function"):
-                scores = self.model.decision_function([normalized_text])
+                scores = self.model.decision_function([normalized])
                 if isinstance(scores, np.ndarray):
-                    if scores.ndim == 1:
-                        confidence = float(abs(scores[0]))
-                    else:
-                        confidence = float(scores[0].max())
-
-            label = self.label_encoder.inverse_transform([prediction])[0]
-            return label, confidence
-
+                    confidence = float(abs(scores[0]) if scores.ndim == 1 else scores[0].max())
+            return self.label_encoder.inverse_transform([prediction])[0], confidence
         except Exception as e:
-            print(f"Error during model prediction: {e}")
+            print(f"Model prediction error: {e}")
             return None, 0.0
-    
-    async def llm_classification(self, data: dict, session: aiohttp.ClientSession) -> tuple:
-        """Use classification API endpoint with async aiohttp"""
-        if not self.classify_api_endpoint:
-            print("CLASSIFY_API_ENDPOINT not configured")
-            return self.get_default_label(), 0.0
-        
+
+    # ── LLM ───────────────────────────────────────────────────────────────────
+
+    async def _call_llm(self, prompt: str, session: aiohttp.ClientSession) -> Optional[str]:
         try:
             headers = {"Content-Type": "application/json"}
-            
+            if self.llm_api_key:
+                headers["Authorization"] = f"Bearer {self.llm_api_key}"
             payload = {
-                "id": data.get("id", ""),
-                "index": data.get("id", ""),
-                "topic": data.get("topic", ""),
-                "title": data.get("title", ""),
-                "content": data.get("content", ""),
-                "description": data.get("description", ""),
-                "type": data.get("type", ""),
-                "project": self.project_name.lower()
+                "model": self.llm_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": 20,
+                "stream": False,
             }
-            
             async with session.post(
-                self.classify_api_endpoint,
+                f"{self.llm_api_url}/chat/completions",
                 headers=headers,
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    
-                    if not result.get("success", False):
-                        error_msg = result.get("error", "Unknown error")
-                        print(f"Classification API returned error: {error_msg}")
-                        return self.get_default_label(), 0.0
-                    
-                    labels = result.get("labels", [])
-                    if not labels:
-                        print("No labels returned from API")
-                        return self.get_default_label(), 0.0
-                    
-                    # Find label with level 1
-                    level1_label = None
-                    for label_obj in labels:
-                        if label_obj.get("level") == 1:
-                            level1_label = label_obj.get("name", "")
-                            break
-                    
-                    if not level1_label:
-                        print("No level 1 label found in response")
-                        return self.get_default_label(), 0.0
-                    
-                    # Default confidence for API classification
-                    confidence = 0.7
-                    
-                    # Validate against project rules if available
-                    project_rules = self.get_project_rules()
-                    if project_rules:
-                        label_lower = level1_label.lower()
-                        for valid_label in self.valid_labels:
-                            if valid_label.lower() == label_lower:
-                                return valid_label, confidence
-                            if valid_label.lower() in label_lower or label_lower in valid_label.lower():
-                                return valid_label, max(0.3, confidence - 0.2)
-                    
-                    return self.get_default_label(), confidence
-                else:
-                    print(f"Classification API error: {response.status}")
-                    return self.get_default_label(), 0.0
-                    
-        except Exception as e:
-            print(f"Classification API error: {e}")
-            return self.get_default_label(), 0.0
-    
-    def classify_sync_rules(self, data: Dict) -> tuple:
-        """
-        Apply synchronous rules only (no LLM)
-        Returns (label, method, confidence) or (None, None, None) if needs LLM
-        """
-        site_name = data.get("siteName", "")
-        author = data.get("author", "")
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    return result["choices"][0]["message"]["content"].strip()
+                return None
+        except Exception:
+            return None
+
+    def _load_prompt_template(self) -> str:
+        path = os.path.join(PROJECT_DIR, "src/prompts/classifier", f"{self.project_name}.txt")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            print(f"Prompt not found: {path}")
+            return ""
+
+    def _build_json_data(self, data: Dict) -> str:
+        buzz_type = "comment" if "comment" in data.get("type", "").lower() else "topic"
+        return json.dumps({
+            "type": buzz_type,
+            "title": data.get("title", ""),
+            "content": data.get("content", ""),
+            "description": data.get("description", ""),
+            "siteName": data.get("siteName", ""),
+        }, ensure_ascii=False, indent=4)
+
+    async def llm_classification(self, data: Dict, session: aiohttp.ClientSession) -> Tuple[Optional[str], float]:
+        if not self.llm_api_url or not data:
+            return None, 0.0
+        template = self._load_prompt_template()
+        if not template:
+            return None, 0.0
+
+        answer = await self._call_llm(template.format(data=self._build_json_data(data)), session)
+        if not answer:
+            return None, 0.0
+
+        confidence = 0.85
+        raw = answer.upper().strip()
+        if "|" in raw:
+            parts = raw.split("|", 1)
+            raw = parts[0].strip()
+            try:
+                confidence = float(parts[1].strip())
+            except ValueError:
+                pass
+
+        for label in self._get_valid_labels():
+            if label.upper() == raw or label.upper() in raw:
+                return label, confidence
+        return None, 0.0
+
+    # ── Classification pipeline ───────────────────────────────────────────────
+
+    def classify_sync_rules(self, data: Dict) -> Tuple[Optional[str], Optional[str], Optional[float]]:
         text = self._extract_text(data)
 
-        # Rule 1: Brand Indicators
-        label, method, confidence = self._check_brand_indicators(site_name, data.get("type", ""), author)
-        if label and confidence > self.confidence_threshold:
-            return label, method, confidence
-        
-        # Rule 2: SiteName Mapping
-        if site_name:
-            label = self._check_sitename(site_name)
-            if label:
-                return label, "SITE NAME", 0.95
-        
-        # Rule 3: Keyword Matching
-        label, method, confidence = self._check_keyword(data)
-        if label and confidence > self.confidence_threshold:
-            return label, method, confidence
+        label, method, conf = self._check_site_rules(data)
+        if label and conf > self.confidence_threshold:
+            return label, method, conf
 
-        # Rule 4: Empty text check
+        label, method, conf = self._check_keyword(data)
+        if label and conf > self.confidence_threshold:
+            return label, method, conf
+
         if not text:
             return self.get_default_label(), "NoText", 0.0
-        
-        # Rule 5: Rule-based Classification
-        label = self.rule_based_classification(text)
-        if label is not None:
-            return label, "RuleBased", 0.8
-        
-        # Rule 6: Model-based Classification (if available)
-        # if self.model is not None:
-        #     label, confidence = self.model_based_classification(text)
-        #     if confidence >= self.confidence_threshold:
-        #         return label, "PretrainedModel", confidence
-        
-        # Needs LLM
+
+        if self.project_name == "ShopeeFood":
+            return "Other", "NoRuleMatched", 0.0
+
         return None, None, None
-    
-    async def classify_async(self, data: Dict, session: aiohttp.ClientSession) -> tuple:
-        """Async classification method - returns (label, method, confidence)"""
-        # Try sync rules first
-        label, method, confidence = self.classify_sync_rules(data)
+
+    async def classify_async(self, data: Dict, session: aiohttp.ClientSession) -> Tuple[str, str, float]:
+        label, method, conf = self.classify_sync_rules(data)
         if label is not None:
-            return label, method, confidence
-        
-        # Need LLM classification
-        label, confidence = await self.llm_classification(data, session)
-        if label is not None and confidence >= self.confidence_threshold:
-            return label, "LLM", confidence
-        
-        # Fallback to model with low confidence
+            return label, method, conf
+
+        label, conf = await self.llm_classification(data, session)
+        if label and conf >= self.confidence_threshold:
+            return label, "LLM", conf
+
         text = self._extract_text(data)
-        label, confidence = self.model_based_classification(text)
-        if label is not None:
-            return label, "LowConfidence", confidence
-        
+        label, conf = self.model_based_classification(text)
+        if label and conf >= self.confidence_threshold:
+            return label, "PretrainedModel", conf
+
         return self.get_default_label(), "LowConfidence", 0.0
-    
-    def classify(self, data: Dict) -> tuple:
-        """Synchronous wrapper for classify_async (for backward compatibility)"""
-        async def _classify():
+
+    def classify(self, data: Dict) -> Tuple[str, str, float]:
+        """Sync wrapper around classify_async."""
+        async def _run():
             async with aiohttp.ClientSession() as session:
                 return await self.classify_async(data, session)
-        
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        return loop.run_until_complete(_classify())
+        return asyncio.get_event_loop().run_until_complete(_run())
 
 
-async def classify_batch_async(classifier: LabelClassifier, rows_data: List[Tuple], session: aiohttp.ClientSession) -> List[Tuple]:
-    """Classify a batch of rows asynchronously"""
-    tasks = []
-    for idx, data in rows_data:
-        task = classifier.classify_async(data, session)
-        tasks.append((idx, task))
-    
-    results = []
-    for idx, task in tasks:
-        try:
-            label, method, confidence = await task
-            results.append((idx, label, method, confidence))
-        except Exception as e:
-            print(f"\nError processing row {idx}: {e}")
-            results.append((idx, "Unknown", "Error", 0.0))
-    
-    return results
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _row_to_dict(row) -> Dict:
+    def safe(col):
+        val = getattr(row, col, "")
+        return str(val) if pd.notna(val) else ""
+    return {
+        "id": safe("Id"), "topic": safe("Topic"),
+        "title": safe("Title"), "content": safe("Content"),
+        "description": safe("Description"), "type": safe("Type"),
+        "siteName": safe("SiteName"), "author": safe("Author"),
+        "siteId": safe("SiteId"), "channel": safe("Channel"),
+        "label": safe("Labels1"),
+    }
 
 
-def classify_category(df: pd.DataFrame, project_name: str, batch_size: int = 10):
-    """Classify dataframe rows - sync rules first, then batch LLM processing"""
-    required_columns = ['Id', 'Topic', 'Title', 'Content', 'Description', 'Type', 'SiteName', 'Author']
-    missing_columns = [col for col in required_columns if col not in df.columns]
+async def classify_category(
+    df: pd.DataFrame,
+    project_name: str,
+    batch_size: int = 10,
+    max_concurrent: int = 10,
+) -> pd.DataFrame:
+    """Two-phase: sync rules first, then concurrent LLM batches."""
+    required = ["Id", "Title", "Content", "Description", "Type", "SiteName"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        print(f"Warning: missing columns {missing}")
 
-    if missing_columns:
-        print(f"Cảnh báo: Các cột sau không tồn tại trong file: {missing_columns}")
-        print(f"Các cột hiện có: {list(df.columns)}")
-
-    print("Đang khởi tạo classifier...")
     classifier = LabelClassifier(project_name=project_name)
     classifier.load_pretrained_model()
     classifier._get_valid_labels()
-    # Prepare data
-    rows_data = []
-    for row in df.itertuples():
-        idx = row.Index
-        data = {
-            "id": str(getattr(row, "Id", "")) if pd.notna(getattr(row, "Id", "")) else "",
-            "topic": str(getattr(row, "Topic", "")) if pd.notna(getattr(row, "Topic", "")) else "",
-            "title": str(getattr(row, "Title", "")) if pd.notna(getattr(row, "Title", "")) else "",
-            "content": str(getattr(row, "Content", "")) if pd.notna(getattr(row, "Content", "")) else "",
-            "description": str(getattr(row, "Description", "")) if pd.notna(getattr(row, "Description", "")) else "",
-            "type": str(getattr(row, "Type", "")) if pd.notna(getattr(row, "Type", "")) else "",
-            "siteName": str(getattr(row, "SiteName", "")) if pd.notna(getattr(row, "SiteName", "")) else "",
-            "author": str(getattr(row, "Author", "")) if pd.notna(getattr(row, "Author", "")) else "",
-        }
-        rows_data.append((idx, data))
 
-    results = [None] * len(df)
-    rows_needing_llm = []
+    # Use df index as key to guarantee correct row assignment
+    rows_data = [(row.Index, _row_to_dict(row)) for row in df.itertuples()]
+    results: Dict[int, Tuple] = {}
+    needs_llm: List[Tuple] = []
 
-    # Phase 1: Apply sync rules to all rows
-    print(f"Phase 1: Applying sync rules to {len(rows_data)} rows...")
-    with tqdm(total=len(rows_data), desc="Sync Rules") as pbar:
-        for idx, data in rows_data:
-            label, method, confidence = classifier.classify_sync_rules(data)
-            if label is not None:
-                results[idx] = (label, method, confidence)
-            else:
-                rows_needing_llm.append((idx, data))
-            pbar.update(1)
+    # Phase 1: sync rules
+    print(f"Phase 1: sync rules on {len(rows_data)} rows...")
+    for idx, data in tqdm(rows_data, desc="Sync Rules"):
+        label, method, conf = classifier.classify_sync_rules(data)
+        if label is not None:
+            results[idx] = (label, method, conf)
+        else:
+            needs_llm.append((idx, data))
 
-    # Phase 2: Batch process rows needing LLM
-    if rows_needing_llm:
-        print(f"\nPhase 2: Processing {len(rows_needing_llm)} rows with LLM (batch size {batch_size})...")
-        
-        async def process_llm_batches():
+    # Phase 2: concurrent LLM
+    if needs_llm:
+        print(f"Phase 2: LLM on {len(needs_llm)} rows (batch={batch_size}, concurrent={max_concurrent})...")
+
+        async def process_batch(batch: List[Tuple], session: aiohttp.ClientSession) -> List[Tuple]:
+            out = []
+            for idx, data in batch:
+                try:
+                    label, method, conf = await classifier.classify_async(data, session)
+                    out.append((idx, label, method, conf))
+                except Exception as e:
+                    print(f"Error on row {idx}: {e}")
+                    out.append((idx, classifier.get_default_label(), "Error", 0.0))
+            return out
+
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def run_llm():
             async with aiohttp.ClientSession() as session:
-                with tqdm(total=len(rows_needing_llm), desc="LLM Processing") as pbar:
-                    for i in range(0, len(rows_needing_llm), batch_size):
-                        batch = rows_needing_llm[i:i+batch_size]
-                        batch_results = await classify_batch_async(classifier, batch, session)
-                        
-                        for idx, label, method, confidence in batch_results:
-                            results[idx] = (label, method, confidence)
-                        
-                        pbar.update(len(batch))
-        
-        # Run async processing
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        loop.run_until_complete(process_llm_batches())
+                batches = [needs_llm[i:i + batch_size] for i in range(0, len(needs_llm), batch_size)]
+
+                async def limited(batch):
+                    async with semaphore:
+                        return await process_batch(batch, session)
+
+                with tqdm(total=len(needs_llm), desc="LLM") as pbar:
+                    for coro in asyncio.as_completed([limited(b) for b in batches]):
+                        for idx, label, method, conf in await coro:
+                            results[idx] = (label, method, conf)
+                            pbar.update(1)
+
+        await run_llm()
     else:
-        print("\nNo rows need LLM processing!")
+        print("No rows need LLM.")
 
-    labels, methods, confidences = zip(*results)
-    df['Label'] = labels
-    df['Method'] = methods
-    df['Confidence'] = confidences
-    df = sanitize_excel_values(df)
-
-    return df
+    # Assign back using df index — guaranteed correct mapping
+    df = df.copy()
+    df["Label"] = df.index.map(lambda i: results[i][0])
+    df["Method"] = df.index.map(lambda i: results[i][1])
+    df["Confidence"] = df.index.map(lambda i: results[i][2])
+    return sanitize_excel_values(df)

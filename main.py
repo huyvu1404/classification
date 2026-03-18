@@ -1,3 +1,4 @@
+import asyncio
 import streamlit as st
 import pandas as pd
 from io import BytesIO
@@ -45,7 +46,7 @@ def download_excel(df: pd.DataFrame, filename: str):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-def app():
+async def app():
     
     st.set_page_config(
         page_title="Phân loại dữ liệu",
@@ -100,10 +101,7 @@ def app():
 
     if uploaded_file:
         df = pd.read_excel(uploaded_file)
-
-        cols = ["SiteId", "Title", "Content", "Description", "TopicId"]
-
-        df[cols] = df[cols].fillna("").astype(str)
+        df = df.fillna("").astype(str)
 
         st.session_state["df_input"] = df
 
@@ -139,7 +137,7 @@ def app():
                 
                 if st.button("⚙️ Xử lý", key="process_relevant"):
                     with st.spinner(f"Đang phân loại Relevant / Irrelevant cho {selected_project_relevant}..."):
-                        st.session_state["df_result_task_1"] = detect_relevant(
+                        st.session_state["df_result_task_1"] = await detect_relevant(
                             st.session_state["df_input"],
                             project_name=st.session_state["selected_project_relevant"],
                             use_llm=True,
@@ -175,7 +173,7 @@ def app():
                 st.session_state["selected_project"] = selected_project
                 if st.button("⚙️ Xử lý", key="process_seller_buyer"):
                     with st.spinner("Đang phân loại Seller / Buyer..."):
-                        st.session_state["df_result_task_2"] = classify_category(
+                        st.session_state["df_result_task_2"] = await classify_category(
                             st.session_state["df_input"],
                             project_name=st.session_state["selected_project"]
                         )
@@ -194,4 +192,4 @@ def app():
 
 
 if __name__ == "__main__":
-    app()
+    asyncio.run(app())
