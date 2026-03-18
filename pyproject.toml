@@ -17,4 +17,6 @@ dependencies = [
     "underthesea>=9.2.11",
     "xlsxwriter>=3.2.9",
     "emoji>=2.15.0",
+    "aiohttp>=3.13.3",
+    "tqdm>=4.67.3",
 ]

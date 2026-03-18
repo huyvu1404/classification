@@ -24,4 +24,4 @@ data/
 init/
 
 test/
-test*
+test_*
