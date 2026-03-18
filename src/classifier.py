@@ -43,7 +43,7 @@ class LabelClassifier:
     def _normalize_text(self, text: str) -> str:
         if not text or pd.isna(text):
             return ""
-        text = unicodedata.normalize("NFKD", str(text))
+        text = unicodedata.normalize("NFC", str(text))
         text = re.sub(r"https?://\S+", "", text)
         text = re.sub(r'[!?.,;:\"\'\(\)\[\]\{\}\/\\\|@#\$%\^\&\*\+=\-_~`<>]', " ", text)
         return re.sub(r"\s+", " ", text).lower().strip()

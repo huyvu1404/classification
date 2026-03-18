@@ -80,7 +80,7 @@ class Detector:
         if not text or pd.isna(text):
             return ""
         
-        text = unicodedata.normalize("NFKD", str(text))
+        text = unicodedata.normalize("NFC", str(text))
         
         text = emoji.replace_emoji(text, replace="")
         
