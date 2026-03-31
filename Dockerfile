@@ -10,7 +10,7 @@ ENV UV_NO_DEV=1
 WORKDIR /app
 RUN uv sync --locked
 
-RUN mkdir -p auth
+RUN mkdir -p auth data
 
 CMD ["sh", "-c", "uv run streamlit run main.py \
   --server.address=${STREAMLIT_HOST} \

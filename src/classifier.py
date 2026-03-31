@@ -13,6 +13,11 @@ from src.models import loader
 from src.settings import PROJECT_DIR
 from src.utils import sanitize_excel_values
 
+import asyncio
+import aiohttp
+from typing import List, Optional, Tuple
+import pandas as pd
+from tqdm import tqdm
 load_dotenv()
 
 LLM_RULES_PATH = os.path.join(PROJECT_DIR, "src/rules/llm-rules.json")
@@ -71,6 +76,9 @@ class LabelClassifier:
     def _get_valid_labels(self) -> List[str]:
         if not self.valid_labels:
             project_kws = self.kws_data.get(self.project_name, {})
+            # fallback: thử key "SPX" nếu project là "SPX Express"
+            if not project_kws and self.project_name == "SPX Express":
+                project_kws = self.kws_data.get("SPX", {})
             self.valid_labels = list(project_kws.keys())
         return self.valid_labels
 
@@ -79,6 +87,8 @@ class LabelClassifier:
     def _check_site_rules(self, data: Dict) -> Tuple[Optional[str], Optional[str], float]:
         """Match by siteId / siteName / channel / label field (flat rule format)."""
         project_kws = self.kws_data.get(self.project_name)
+        if not project_kws and self.project_name == "SPX Express":
+            project_kws = self.kws_data.get("SPX")
         if not project_kws:
             return None, None, 0
 
@@ -86,15 +96,16 @@ class LabelClassifier:
         site_name = self._normalize_text(data.get("siteName", ""))
         channel = self._normalize_text(data.get("channel", ""))
         label_field = self._normalize_text(data.get("label", ""))
+        author = self._normalize_text(data.get("author", ""))
 
         for label, rules in project_kws.items():
             for rule in rules if isinstance(rules, list) else [rules]:
                 if "condition" in rule or "keywords" in rule:
                     continue
-                for sid in rule.get("siteId", []):
+                for sid in rule.get("siteIds", rule.get("siteId", [])):
                     if site_id and site_id == str(sid).strip():
                         return label, "SITE ID", 0.95
-                for sn in rule.get("siteName", []):
+                for sn in rule.get("siteNames", rule.get("siteName", [])):
                     nsn = self._normalize_text(sn)
                     if nsn and (nsn in site_name or site_name in nsn):
                         return label, "SITE NAME", 0.95
@@ -106,11 +117,17 @@ class LabelClassifier:
                     nlb = self._normalize_text(lb)
                     if nlb and nlb in label_field:
                         return label, "LABEL FIELD", 0.95
+                for au in rule.get("authors", rule.get("author", [])):
+                    nau = self._normalize_text(au)
+                    if nau and nau in author:
+                        return label, "AUTHOR", 0.95
         return None, None, 0
 
     def _check_keyword(self, data: Dict) -> Tuple[Optional[str], Optional[str], float]:
         """Match by keyword rules with optional type/siteName conditions."""
         project_kws = self.kws_data.get(self.project_name)
+        if not project_kws and self.project_name == "SPX Express":
+            project_kws = self.kws_data.get("SPX")
         if not project_kws:
             return None, None, 0
 
@@ -150,10 +167,15 @@ class LabelClassifier:
             normalized = self._normalize_text(text)
             prediction = self.model.predict([normalized])[0]
             confidence = 0.0
-            if hasattr(self.model, "decision_function"):
+            if hasattr(self.model, "predict_proba"):
+                proba = self.model.predict_proba([normalized])[0]
+                confidence = float(np.max(proba))
+            elif hasattr(self.model, "decision_function"):
                 scores = self.model.decision_function([normalized])
                 if isinstance(scores, np.ndarray):
-                    confidence = float(abs(scores[0]) if scores.ndim == 1 else scores[0].max())
+                    raw = float(scores[0]) if scores.ndim == 1 else float(scores[0].max())
+                    # sigmoid để normalize về [0, 1]
+                    confidence = float(1 / (1 + np.exp(-raw)))
             return self.label_encoder.inverse_transform([prediction])[0], confidence
         except Exception as e:
             print(f"Model prediction error: {e}")
@@ -217,7 +239,7 @@ class LabelClassifier:
             return None, 0.0
 
         confidence = 0.85
-        raw = answer.upper().strip()
+        raw = answer.strip()
         if "|" in raw:
             parts = raw.split("|", 1)
             raw = parts[0].strip()
@@ -226,8 +248,14 @@ class LabelClassifier:
             except ValueError:
                 pass
 
+        # GHN: map alias từ prompt về label thực trước khi so sánh
+        if self.project_name == "Giao Hàng Nhanh" and "NGƯỜI GỬI HÀNG" in raw.upper():
+            raw = "NGƯỜI MUA HÀNG"
+
+        raw_upper = raw.upper()
         for label in self._get_valid_labels():
-            if label.upper() == raw or label.upper() in raw:
+            label_upper = label.upper()
+            if label_upper == raw_upper or label_upper in raw_upper:
                 return label, confidence
         return None, 0.0
 
@@ -247,9 +275,6 @@ class LabelClassifier:
 
         if not text:
             return self.get_default_label(), "NoText", 0.0
-
-        if self.project_name == "ShopeeFood":
-            return "Other", "NoRuleMatched", 0.0
 
         return None, None, None
 
@@ -311,11 +336,6 @@ def _row_to_dict(row) -> Dict:
     }
 
 
-import asyncio
-import aiohttp
-from typing import List, Optional, Tuple
-import pandas as pd
-from tqdm import tqdm
 
 async def classify_category(
     df: pd.DataFrame,

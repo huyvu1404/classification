@@ -37,7 +37,7 @@
                 ]
             },
             {
-                "siteName": [
+                "siteNames": [
                     "Mã giảm giá",
                     "CỘNG ĐỒNG HÓNG TIKTOK SHOP - SHOPEE - AFFILIATE",
                     "Cộng Đồng Affiliate",
@@ -118,7 +118,7 @@
                 ]
             },
             {
-                "siteName": [
+                "siteNames": [
                     "Shopee người bán - Chia sẻ kinh nghiệm bán hàng nghìn đơn",
                     "Shopee người bán - Chia sẻ kinh nghiệm bán hàng nghìn đơn - Shopee",
                     "Lập nghiệp với Shopee",
@@ -139,7 +139,7 @@
     "ShopeeFood": {
         "Brand": [
             {
-                "siteId": [
+                "siteIds": [
                     "1378455622385980", "100268561763125", "100064359235089",
                     "1949193615355172", "206294870224495", "UC0QKbvP4XKGCw5s4iSXGywQ",
                     "6874848369672766465", "288689321975657", "609107658958174",
@@ -153,7 +153,7 @@
         ],
         "Shipper": [
             {
-                "siteId": [
+                "siteIds": [
                     "351517125205585", "206294870224495", "444229606225364",
                     "207429699748444", "123660198492008", "3033503813542745",
                     "425665649276227", "295924254367200", "882362433263971",
@@ -169,7 +169,7 @@
                     "545661004018191", "535240172773404", "587055226479007",
                     "874812217374583", "1512493238771545", "1166437517249486"
                 ],
-                "siteName": [
+                "siteNames": [
                     "AE Shipper NOW", "AE Tài Xế Công Nghệ Hà Nội✅", "Anh em Chiến Binh Loship",
                     "Anh em Shipper Now Hà Nội", "Anh Em Shipper Now HN", "BAEMIN Shipper HCM",
                     "Chiến binh Gojek Vietnam", "Chiến Binh Loship Sài Gòn", "cộng đồng Delivery Now Đà Nẵng",
@@ -240,13 +240,13 @@
         "Merchant": [
             {
                 "labels": ["classified ad"],
-                "siteId": [
+                "siteIds": [
                     "1190967199422235", "3903616859855826", "248213749803509",
                     "657134938324444", "106368994375020", "616080631925656",
                     "417338716763303", "1009458512867274", "783527472654715",
                     "213755129097546", "1059329209646709", "2043430095815602"
                 ],
-                "siteName": [
+                "siteNames": [
                     "Cộng đồng chủ Nhà hàng (Now, Grabfood, Gofood, Beamin, Loship...)",
                     "CỘNG ĐỒNG ĐỐI TÁC GRAPFOOD- NOW- GOVIET- BAEMIN",
                     "Cộng đồng Đối tác nhà hàng BAEMIN",
@@ -277,22 +277,68 @@
         ]
     },
     "Giao Hàng Nhanh": {
-        "NGƯỜI MUA HÀNG": [
+        "Người Mua Hàng": [
             {
-                "siteId": ["2624337991187315"]
+                "keywords": [
+                    "shop", "người bán", "người gửi",
+                    "Tạo đơn", "huỷ đơn",
+                    "Lấy hàng",
+                    "COD",
+                    "Phí vận chuyển",
+                    "Đối soát", "hoàn tiền",
+                    "Hợp đồng"
+                ]
+            }
+        ],
+        "Người Nhận Hàng": [
+            {
+                "keywords": [
+                    "khách", "người nhận", "em nhận hàng",
+                    "Chưa nhận được hàng",
+                    "Giao trễ", "giao sai",
+                    "Không liên hệ được shipper",
+                    "Hẹn giao lại",
+                    "Phí thu hộ khi nhận",
+                    "Không liên lạc"
+                ]
+            }
+        ],
+        "Tài Xế": [
+            {
+                "keywords": [
+                    "shipper, tài xế, em là NV giao hàng",
+                    "App tài xế lỗi",
+                    "Không liên hệ được khách",
+                    "Lấy hàng thất bại",
+                    "Báo hoàn",
+                    "Cập nhật trạng thái đơn"
+                ]
+            }
+        ],
+        "Khác": [
+            {
+                "authors": [
+                    "Giao Hàng Nhanh - GHN"
+                ]
             }
         ]
     },
-    "SPX": {
-        "Seller": {
-            "siteId": ["280705278253572", "725900121547792"],
-            "keyword": ["đồng giá"]
-        },
-        "Other": {
-            "keyword": [
-                "số kg thực Kiện Hàng",
-                "Shop mới gửi đơn – có thêm lì xì"
-            ]
-        }
+    "SPX Express": {
+        "Seller": [
+            {
+                "siteIds": ["280705278253572", "725900121547792"]
+            },
+            {
+                "keywords": ["đồng giá"]
+            }
+        ],
+        "Other": [
+            {
+                "keywords": [
+                    "số kg thực Kiện Hàng",
+                    "Shop mới gửi đơn – có thêm lì xì"
+                ]
+            }
+        ]         
     }
 }

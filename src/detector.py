@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from src.settings import PROJECT_DIR
 from src.utils import sanitize_excel_values
+from src.llm_cache import load_cache, save_cache, get_cached, set_cached
 
 load_dotenv()
 nest_asyncio.apply()
@@ -160,31 +161,36 @@ class Detector:
         except Exception:
             return False
 
-    async def _llm_detect(self, row: pd.Series, session: aiohttp.ClientSession) -> Optional[str]:
-        """Single LLM call returning is_relevant."""
-        
-        comment = self._get_str(row, "Content")
-        
+    async def _llm_detect(self, row: pd.Series, session: aiohttp.ClientSession, cache: dict) -> Optional[str]:
+        """Single LLM call returning is_relevant, with cache."""
+        title = self._get_str(row, "Title")
+        content = self._get_str(row, "Content")
+        description = self._get_str(row, "Description")
+
+        cached = get_cached(cache, title, content, description)
+        if cached is not None:
+            return cached
+
         data = json.dumps({
-            "content": self._get_str(row, "Title"),
-            "comment": self._get_str(row, "Content")
+            "content": title,
+            "comment": content
         }, ensure_ascii=False)
-        
-        name_tag_prompt = _load_prompt("name_tag_detection", comment=comment)
+
+        name_tag_prompt = _load_prompt("name_tag_detection", comment=content)
         relevance_prompt = _load_prompt("content_relevance", project=self.project_name, data=data)
-        
+
         if not name_tag_prompt and not relevance_prompt:
             return None
-        
+
         include_name_tag = await self._call_llm(name_tag_prompt, session)
         if include_name_tag:
+            set_cached(cache, title, content, description, "Yes")
             return "Yes"
-        
+
         is_relevant = await self._call_llm(relevance_prompt, session)
-        if is_relevant:
-            return "Yes"
-        
-        return None
+        result = "Yes" if is_relevant else None
+        set_cached(cache, title, content, description, result)
+        return result
 
     def _detect_sync(self, row: pd.Series) -> Tuple[Optional[str], str]:
         """Returns (result, rule, explanation) or (None, '', '') if LLM needed."""
@@ -223,19 +229,18 @@ class Detector:
 
     # ── Async LLM detection ───────────────────────────────────────────────────
 
-    async def _detect_row_llm(self, idx: int, row: pd.Series, session: aiohttp.ClientSession) -> Tuple[int, str, str]:
+    async def _detect_row_llm(self, idx: int, row: pd.Series, session: aiohttp.ClientSession, cache: dict) -> Tuple[int, str, str]:
         title = self._get_str(row, "Title")
         content = self._get_str(row, "Content")
 
         if not content.strip():
             return idx, "No", "Empty Content"
 
-        relevant = await self._llm_detect(row, session)
+        relevant = await self._llm_detect(row, session, cache)
         if relevant is not None:
             title_matches = self._find_matches(title, self.project_keywords)
             if title_matches:
                 return idx, relevant.capitalize(), "Rule 9: LLM Relevance"
-
 
         return idx, "No", "Can't Detect"
 
@@ -248,22 +253,43 @@ class Detector:
         batch_size: int = 20,
         max_concurrent: int = 10,
     ) -> pd.DataFrame:
-        """Two-phase: sync rules first, then concurrent LLM batches."""
-        # Use df index as key to guarantee correct row assignment
+        """Two-phase: sync rules first, then concurrent LLM batches.
+        LLM chỉ được gọi cho topic rows. Comment rows được gán kết quả từ topic cha (ParentId).
+        Comment không được gán sẽ được call LLM sau.
+        """
         results: Dict[int, Tuple[str, str]] = {}
         needs_llm: List[Tuple[int, pd.Series]] = []
 
-        # Phase 1: sync rules
+        has_parent_id = "ParentId" in df.columns
+        has_type = "Type" in df.columns
+
+        def _is_topic(row: pd.Series) -> bool:
+            if not has_type:
+                return True
+            t = str(row.get("Type", "")).lower()
+            return "topic" in t
+
+        def _is_comment_row(row: pd.Series) -> bool:
+            if not has_type:
+                return False
+            t = str(row.get("Type", "")).lower()
+            return "comment" in t
+
+        # Phase 1: sync rules cho tất cả rows
         for idx, row in df.iterrows():
             result, rule = self._detect_sync(row)
             if result is not None:
                 results[idx] = (result, rule)
-            else:
+            elif _is_topic(row):
                 needs_llm.append((idx, row))
+            # comment rows chưa có kết quả sẽ xử lý sau phase 2
 
-        # Phase 2: concurrent LLM
+        # Phase 2: LLM cho topic rows
+        cache = load_cache()
+        topic_llm_results: Dict[int, Tuple[str, str]] = {}
+
         if needs_llm and use_llm:
-            print(f"\nLLM: processing {len(needs_llm)} rows (batch={batch_size}, concurrent={max_concurrent})...")
+            print(f"\nLLM: processing {len(needs_llm)} topic rows (batch={batch_size}, concurrent={max_concurrent})...")
             semaphore = asyncio.Semaphore(max_concurrent)
 
             async def limited_batch(batch: List[Tuple[int, pd.Series]], session: aiohttp.ClientSession):
@@ -271,7 +297,7 @@ class Detector:
                     out = []
                     for idx, row in batch:
                         try:
-                            out.append(await self._detect_row_llm(idx, row, session))
+                            out.append(await self._detect_row_llm(idx, row, session, cache))
                         except Exception as e:
                             print(f"Error on row {idx}: {e}")
                             out.append((idx, "No", "Error"))
@@ -280,23 +306,82 @@ class Detector:
             async def run_llm():
                 async with aiohttp.ClientSession() as session:
                     batches = [needs_llm[i:i + batch_size] for i in range(0, len(needs_llm), batch_size)]
-                    with tqdm(total=len(needs_llm), desc="LLM") as pbar:
+                    with tqdm(total=len(needs_llm), desc="LLM (topics)") as pbar:
                         for coro in asyncio.as_completed([limited_batch(b, session) for b in batches]):
+                            batch_results = await coro
+                            for idx, result, rule in batch_results:
+                                topic_llm_results[idx] = (result, rule)
+                            pbar.update(len(batch_results))
+
+            await run_llm()
+            save_cache(cache)
+        else:
+            if needs_llm and not use_llm:
+                print(f"LLM disabled. Marking {len(needs_llm)} topic rows as No.")
+            for idx, _ in needs_llm:
+                topic_llm_results[idx] = ("No", "No Match")
+
+        results.update(topic_llm_results)
+
+        # Phase 3: gán kết quả cho comment rows dựa vào ParentId
+        # Build map: parent_id_value -> result từ topic row
+        topic_result_by_id: Dict[str, Tuple[str, str]] = {}
+        if has_parent_id and "Id" in df.columns:
+            for idx, row in df.iterrows():
+                if _is_topic(row) and idx in results:
+                    row_id = str(row.get("Id", "")).strip()
+                    if row_id:
+                        topic_result_by_id[row_id] = results[idx]
+
+        # Gán comment rows chưa có kết quả
+        unassigned_comments: List[Tuple[int, pd.Series]] = []
+        for idx, row in df.iterrows():
+            if idx in results:
+                continue
+            if _is_comment_row(row):
+                if has_parent_id:
+                    parent_id = str(row.get("ParentId", "")).strip()
+                    if parent_id and parent_id in topic_result_by_id:
+                        results[idx] = (topic_result_by_id[parent_id][0], "Inherited from Topic")
+                        continue
+                unassigned_comments.append((idx, row))
+
+        # Phase 4: LLM cho comment rows không được gán
+        if unassigned_comments and use_llm:
+            print(f"\nLLM: processing {len(unassigned_comments)} unassigned comment rows...")
+            semaphore = asyncio.Semaphore(max_concurrent)
+
+            async def limited_batch_comments(batch: List[Tuple[int, pd.Series]], session: aiohttp.ClientSession):
+                async with semaphore:
+                    out = []
+                    for idx, row in batch:
+                        try:
+                            out.append(await self._detect_row_llm(idx, row, session, cache))
+                        except Exception as e:
+                            print(f"Error on row {idx}: {e}")
+                            out.append((idx, "No", "Error"))
+                    return out
+
+            async def run_llm_comments():
+                async with aiohttp.ClientSession() as session:
+                    batches = [unassigned_comments[i:i + batch_size] for i in range(0, len(unassigned_comments), batch_size)]
+                    with tqdm(total=len(unassigned_comments), desc="LLM (unassigned comments)") as pbar:
+                        for coro in asyncio.as_completed([limited_batch_comments(b, session) for b in batches]):
                             batch_results = await coro
                             for idx, result, rule in batch_results:
                                 results[idx] = (result, rule)
                             pbar.update(len(batch_results))
-            await run_llm()
-        else:
-            if needs_llm and not use_llm:
-                print(f"LLM disabled. Marking {len(needs_llm)} rows as No.")
-            for idx, _ in needs_llm:
-                results[idx] = ("No", "No Match")
 
-        # Assign back using df index — guaranteed correct mapping
+            await run_llm_comments()
+            save_cache(cache)
+        else:
+            for idx, _ in unassigned_comments:
+                if idx not in results:
+                    results[idx] = ("No", "No Match")
+
+        # Assign back
         df = df.copy()
-        df["Yes/No"] = df.index.map(lambda i: results[i][0])
-        # df["Rule"] = df.index.map(lambda i: results[i][1])
+        df["Yes/No"] = df.index.map(lambda i: results.get(i, ("No", "No Match"))[0])
 
         rule_stats: Dict[str, int] = {}
         for _, rule in results.values():
