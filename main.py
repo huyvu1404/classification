@@ -2,6 +2,7 @@ import asyncio
 import streamlit as st
 import pandas as pd
 from io import BytesIO
+from stqdm import stqdm
 from src.classifier import classify_category
 from src.detector import detect_relevant
 
@@ -141,7 +142,8 @@ async def app():
                             st.session_state["df_input"],
                             project_name=st.session_state["selected_project_relevant"],
                             use_llm=True,
-                            batch_size=10
+                            batch_size=10,
+                            tqdm_func=stqdm,
                         )
                         st.session_state["disabled"] = True
 
@@ -175,7 +177,8 @@ async def app():
                     with st.spinner("Đang phân loại Seller / Buyer..."):
                         st.session_state["df_result_task_2"] = await classify_category(
                             st.session_state["df_input"],
-                            project_name=st.session_state["selected_project"]
+                            project_name=st.session_state["selected_project"],
+                            tqdm_func=stqdm,
                         )
                         st.session_state["disabled"] = True
 

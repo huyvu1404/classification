@@ -12,12 +12,8 @@ from dotenv import load_dotenv
 from src.models import loader
 from src.settings import PROJECT_DIR
 from src.utils import sanitize_excel_values
+from src.llm_cache import load_cache, save_cache, get_cached, set_cached
 
-import asyncio
-import aiohttp
-from typing import List, Optional, Tuple
-import pandas as pd
-from tqdm import tqdm
 load_dotenv()
 
 LLM_RULES_PATH = os.path.join(PROJECT_DIR, "src/rules/llm-rules.json")
@@ -42,6 +38,7 @@ class LabelClassifier:
 
         self.model = None
         self.label_encoder = None
+        self._prompt_template: Optional[str] = None
 
     # ── Text helpers ──────────────────────────────────────────────────────────
 
@@ -76,7 +73,6 @@ class LabelClassifier:
     def _get_valid_labels(self) -> List[str]:
         if not self.valid_labels:
             project_kws = self.kws_data.get(self.project_name, {})
-            # fallback: thử key "SPX" nếu project là "SPX Express"
             if not project_kws and self.project_name == "SPX Express":
                 project_kws = self.kws_data.get("SPX", {})
             self.valid_labels = list(project_kws.keys())
@@ -85,7 +81,6 @@ class LabelClassifier:
     # ── Rule matching ─────────────────────────────────────────────────────────
 
     def _check_site_rules(self, data: Dict) -> Tuple[Optional[str], Optional[str], float]:
-        """Match by siteId / siteName / channel / label field (flat rule format)."""
         project_kws = self.kws_data.get(self.project_name)
         if not project_kws and self.project_name == "SPX Express":
             project_kws = self.kws_data.get("SPX")
@@ -124,7 +119,6 @@ class LabelClassifier:
         return None, None, 0
 
     def _check_keyword(self, data: Dict) -> Tuple[Optional[str], Optional[str], float]:
-        """Match by keyword rules with optional type/siteName conditions."""
         project_kws = self.kws_data.get(self.project_name)
         if not project_kws and self.project_name == "SPX Express":
             project_kws = self.kws_data.get("SPX")
@@ -174,7 +168,6 @@ class LabelClassifier:
                 scores = self.model.decision_function([normalized])
                 if isinstance(scores, np.ndarray):
                     raw = float(scores[0]) if scores.ndim == 1 else float(scores[0].max())
-                    # sigmoid để normalize về [0, 1]
                     confidence = float(1 / (1 + np.exp(-raw)))
             return self.label_encoder.inverse_transform([prediction])[0], confidence
         except Exception as e:
@@ -209,13 +202,16 @@ class LabelClassifier:
             return None
 
     def _load_prompt_template(self) -> str:
+        if self._prompt_template is not None:
+            return self._prompt_template
         path = os.path.join(PROJECT_DIR, "src/prompts/classifier", f"{self.project_name}.txt")
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return f.read()
+                self._prompt_template = f.read()
         except FileNotFoundError:
             print(f"Prompt not found: {path}")
-            return ""
+            self._prompt_template = ""
+        return self._prompt_template
 
     def _build_json_data(self, data: Dict) -> str:
         buzz_type = "comment" if "comment" in data.get("type", "").lower() else "topic"
@@ -227,12 +223,21 @@ class LabelClassifier:
             "siteName": data.get("siteName", ""),
         }, ensure_ascii=False, indent=4)
 
-    async def llm_classification(self, data: Dict, session: aiohttp.ClientSession) -> Tuple[Optional[str], float]:
+    async def llm_classification(self, data: Dict, session: aiohttp.ClientSession, cache: dict = None) -> Tuple[Optional[str], float]:
         if not self.llm_api_url or not data:
             return None, 0.0
         template = self._load_prompt_template()
         if not template:
             return None, 0.0
+
+        title = data.get("title", "")
+        content = data.get("content", "")
+        description = data.get("description", "")
+
+        if cache is not None:
+            cached = get_cached(cache, title, content, description)
+            if cached is not None:
+                return cached  # (label, confidence)
 
         answer = await self._call_llm(template.format(data=self._build_json_data(data)), session)
         if not answer:
@@ -248,7 +253,6 @@ class LabelClassifier:
             except ValueError:
                 pass
 
-        # GHN: map alias từ prompt về label thực trước khi so sánh
         if self.project_name == "Giao Hàng Nhanh" and "NGƯỜI GỬI HÀNG" in raw.upper():
             raw = "NGƯỜI MUA HÀNG"
 
@@ -256,7 +260,13 @@ class LabelClassifier:
         for label in self._get_valid_labels():
             label_upper = label.upper()
             if label_upper == raw_upper or label_upper in raw_upper:
-                return label, confidence
+                result = (label, confidence)
+                if cache is not None:
+                    set_cached(cache, title, content, description, result)
+                return result
+
+        if cache is not None:
+            set_cached(cache, title, content, description, (None, 0.0))
         return None, 0.0
 
     # ── Classification pipeline ───────────────────────────────────────────────
@@ -278,12 +288,12 @@ class LabelClassifier:
 
         return None, None, None
 
-    async def classify_async(self, data: Dict, session: aiohttp.ClientSession) -> Tuple[str, str, float]:
+    async def classify_async(self, data: Dict, session: aiohttp.ClientSession, cache: dict = None) -> Tuple[str, str, float]:
         label, method, conf = self.classify_sync_rules(data)
         if label is not None:
             return label, method, conf
 
-        label, conf = await self.llm_classification(data, session)
+        label, conf = await self.llm_classification(data, session, cache)
         if label and conf >= self.confidence_threshold:
             return label, "LLM", conf
 
@@ -310,16 +320,16 @@ class LabelClassifier:
 
 # ── Batch helpers ─────────────────────────────────────────────────────────────
 
-async def _classify_batch(classifier: LabelClassifier, batch: List[Tuple], session: aiohttp.ClientSession) -> List[Tuple]:
-    results = []
-    for idx, data in batch:
+async def _classify_batch(classifier: LabelClassifier, batch: List[Tuple], session: aiohttp.ClientSession, cache: dict = None) -> List[Tuple]:
+    async def _classify_one(idx, data):
         try:
-            label, method, conf = await classifier.classify_async(data, session)
-            results.append((idx, label, method, conf))
+            label, method, conf = await classifier.classify_async(data, session, cache)
+            return (idx, label, method, conf)
         except Exception as e:
             print(f"Error on row {idx}: {e}")
-            results.append((idx, "Unknown", "Error", 0.0))
-    return results
+            return (idx, "Unknown", "Error", 0.0)
+
+    return await asyncio.gather(*[_classify_one(idx, data) for idx, data in batch])
 
 
 def _row_to_dict(row) -> Dict:
@@ -333,6 +343,7 @@ def _row_to_dict(row) -> Dict:
         "siteName": safe("SiteName"), "author": safe("Author"),
         "siteId": safe("SiteId"), "channel": safe("Channel"),
         "label": safe("Labels1"),
+        "parentId": safe("ParentId"),
     }
 
 
@@ -341,9 +352,15 @@ async def classify_category(
     df: pd.DataFrame,
     project_name: str,
     batch_size: int = 10,
-    max_concurrent: int = 10         
+    max_concurrent: int = 10,
+    tqdm_func=None,
 ) -> pd.DataFrame:
-    """Two-phase classification: sync rules first, then batch LLM for remaining rows with controlled concurrency."""
+    """Classification pipeline:
+    - Phase 1: sync rules cho tất cả rows
+    - Phase 2: LLM chỉ cho topic rows
+    - Phase 3: gán kết quả cho comment rows có cùng ParentId với topic
+    - Phase 4: LLM cho comment rows không được gán
+    """
     required = ["Id", "Title", "Content", "Description", "Type", "SiteName"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -353,60 +370,114 @@ async def classify_category(
     classifier.load_pretrained_model()
     classifier._get_valid_labels()
 
+    has_parent_id = "ParentId" in df.columns
+    has_type = "Type" in df.columns
+
+    def _is_topic(data: dict) -> bool:
+        if not has_type:
+            return True
+        return "topic" in data.get("type", "").lower()
+
+    def _is_comment(data: dict) -> bool:
+        if not has_type:
+            return False
+        return "comment" in data.get("type", "").lower()
+
     rows_data = [(row.Index, _row_to_dict(row)) for row in df.itertuples()]
     results: List[Optional[Tuple]] = [None] * len(df)
     needs_llm = []
 
-    # Phase 1: sync rules (giữ nguyên)
+    if tqdm_func is None:
+        tqdm_func = tqdm
+
+    # Phase 1: sync rules
     print(f"Phase 1: sync rules on {len(rows_data)} rows...")
-    for idx, data in tqdm(rows_data, desc="Sync Rules"):
+    for idx, data in tqdm_func(rows_data, desc="Sync Rules"):
         label, method, conf = classifier.classify_sync_rules(data)
         if label is not None:
             results[idx] = (label, method, conf)
-        else:
+        elif _is_topic(data):
             needs_llm.append((idx, data))
+        # comment chưa có kết quả sẽ xử lý ở phase 3/4
 
-    # Phase 2: LLM với semaphore giới hạn concurrency
-    if needs_llm:
-        print(f"Phase 2: LLM on {len(needs_llm)} rows (batch={batch_size}, max_concurrent={max_concurrent})...")
+    cache = load_cache()
 
-        async def run_llm():
-            semaphore = asyncio.Semaphore(max_concurrent)
+    async def run_llm_batch(batch_list, desc_label):
+        semaphore = asyncio.Semaphore(max_concurrent)
 
-            async def classify_with_limit(batch):
-                async with semaphore:
-                    return await _classify_batch(classifier, batch, session)
+        async def classify_with_limit(batch):
+            async with semaphore:
+                return await _classify_batch(classifier, batch, session, cache)
 
-            async with aiohttp.ClientSession() as session:
-                # Tạo tất cả các task cho từng batch
-                tasks = []
-                for i in range(0, len(needs_llm), batch_size):
-                    batch = needs_llm[i:i + batch_size]
-                    tasks.append(classify_with_limit(batch))
+        async with aiohttp.ClientSession() as session:
+            tasks = [
+                classify_with_limit(batch_list[i:i + batch_size])
+                for i in range(0, len(batch_list), batch_size)
+            ]
+            all_results = []
+            with tqdm_func(total=len(batch_list), desc=desc_label) as pbar:
+                for coro in asyncio.as_completed(tasks):
+                    batch_results = await coro
+                    all_results.extend(batch_results)
+                    pbar.update(len(batch_results))
+        return all_results
 
-                # Chạy tất cả task với as_completed để cập nhật tiến trình dần dần
-                with tqdm(total=len(needs_llm), desc="LLM") as pbar:
-                    for coro in asyncio.as_completed(tasks):
-                        batch_results = await coro
-                        for idx, label, method, conf in batch_results:
-                            results[idx] = (label, method, conf)
-                        pbar.update(len(batch_results))  # update theo số item thực tế trong batch
-
-        # Chạy async function
+    def _run_async(coro):
         try:
             loop = asyncio.get_running_loop()
+            return loop.run_until_complete(coro)
         except RuntimeError:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
 
-        loop.run_until_complete(run_llm())
-
+    # Phase 2: LLM cho topic rows
+    if needs_llm:
+        print(f"Phase 2: LLM on {len(needs_llm)} topic rows (batch={batch_size}, max_concurrent={max_concurrent})...")
+        topic_results = _run_async(run_llm_batch(needs_llm, "LLM (topics)"))
+        for idx, label, method, conf in topic_results:
+            results[idx] = (label, method, conf)
+        save_cache(cache)
     else:
-        print("No rows need LLM.")
+        print("No topic rows need LLM.")
+
+    # Phase 3: gán comment rows từ topic cha qua ParentId
+    topic_result_by_id: Dict[str, Tuple] = {}
+    if has_parent_id and "Id" in df.columns:
+        for row in df.itertuples():
+            idx = row.Index
+            data = _row_to_dict(row)
+            if _is_topic(data) and results[idx] is not None:
+                row_id = str(getattr(row, "Id", "")).strip()
+                if row_id:
+                    topic_result_by_id[row_id] = results[idx]
+
+    unassigned_comments = []
+    for row in df.itertuples():
+        idx = row.Index
+        if results[idx] is not None:
+            continue
+        data = _row_to_dict(row)
+        if _is_comment(data):
+            if has_parent_id:
+                parent_id = str(getattr(row, "ParentId", "")).strip()
+                if parent_id and parent_id in topic_result_by_id:
+                    parent_label, parent_method, parent_conf = topic_result_by_id[parent_id]
+                    results[idx] = (parent_label, "Inherited from Topic", parent_conf)
+                    continue
+            unassigned_comments.append((idx, data))
+
+    # Phase 4: LLM cho comment rows không được gán
+    if unassigned_comments:
+        print(f"Phase 4: LLM on {len(unassigned_comments)} unassigned comment rows...")
+        comment_results = _run_async(run_llm_batch(unassigned_comments, "LLM (unassigned comments)"))
+        for idx, label, method, conf in comment_results:
+            results[idx] = (label, method, conf)
+        save_cache(cache)
+    else:
+        print("No unassigned comment rows.")
 
     labels, methods, confs = zip(*[r if r is not None else (None, "none", 0.0) for r in results])
     df = df.copy()
     df["Label"] = labels
-    # df["Method"] = methods
-    # df["Confidence"] = confs
     return sanitize_excel_values(df)

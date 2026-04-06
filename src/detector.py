@@ -182,12 +182,16 @@ class Detector:
         if not name_tag_prompt and not relevance_prompt:
             return None
 
-        include_name_tag = await self._call_llm(name_tag_prompt, session)
+        # Gọi song song 2 LLM calls thay vì tuần tự
+        include_name_tag, is_relevant = await asyncio.gather(
+            self._call_llm(name_tag_prompt, session),
+            self._call_llm(relevance_prompt, session),
+        )
+
         if include_name_tag:
             set_cached(cache, title, content, description, "Yes")
             return "Yes"
 
-        is_relevant = await self._call_llm(relevance_prompt, session)
         result = "Yes" if is_relevant else None
         set_cached(cache, title, content, description, result)
         return result
@@ -252,6 +256,7 @@ class Detector:
         use_llm: bool = False,
         batch_size: int = 20,
         max_concurrent: int = 10,
+        tqdm_func=None,
     ) -> pd.DataFrame:
         """Two-phase: sync rules first, then concurrent LLM batches.
         LLM chỉ được gọi cho topic rows. Comment rows được gán kết quả từ topic cha (ParentId).
@@ -259,6 +264,9 @@ class Detector:
         """
         results: Dict[int, Tuple[str, str]] = {}
         needs_llm: List[Tuple[int, pd.Series]] = []
+
+        if tqdm_func is None:
+            tqdm_func = tqdm
 
         has_parent_id = "ParentId" in df.columns
         has_type = "Type" in df.columns
@@ -306,7 +314,7 @@ class Detector:
             async def run_llm():
                 async with aiohttp.ClientSession() as session:
                     batches = [needs_llm[i:i + batch_size] for i in range(0, len(needs_llm), batch_size)]
-                    with tqdm(total=len(needs_llm), desc="LLM (topics)") as pbar:
+                    with tqdm_func(total=len(needs_llm), desc="LLM (topics)") as pbar:
                         for coro in asyncio.as_completed([limited_batch(b, session) for b in batches]):
                             batch_results = await coro
                             for idx, result, rule in batch_results:
@@ -365,7 +373,7 @@ class Detector:
             async def run_llm_comments():
                 async with aiohttp.ClientSession() as session:
                     batches = [unassigned_comments[i:i + batch_size] for i in range(0, len(unassigned_comments), batch_size)]
-                    with tqdm(total=len(unassigned_comments), desc="LLM (unassigned comments)") as pbar:
+                    with tqdm_func(total=len(unassigned_comments), desc="LLM (unassigned comments)") as pbar:
                         for coro in asyncio.as_completed([limited_batch_comments(b, session) for b in batches]):
                             batch_results = await coro
                             for idx, result, rule in batch_results:
@@ -406,5 +414,8 @@ async def detect_relevant(
     use_llm: bool = False,
     batch_size: int = 20,
     max_concurrent: int = 10,
+    tqdm_func=None,
 ) -> pd.DataFrame:
-    return await Detector(project_name=project_name).detect_async(df, use_llm=use_llm, batch_size=batch_size, max_concurrent=max_concurrent)
+    return await Detector(project_name=project_name).detect_async(
+        df, use_llm=use_llm, batch_size=batch_size, max_concurrent=max_concurrent, tqdm_func=tqdm_func
+    )

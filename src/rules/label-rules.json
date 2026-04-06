@@ -286,32 +286,52 @@
                     "COD",
                     "Phí vận chuyển",
                     "Đối soát", "hoàn tiền",
-                    "Hợp đồng"
+                    "Hợp đồng",
+                    "lên đơn",
+                    "gửi hàng",
+                    "COD",
+                    "phí ship",
+                    "pickup",
+                    "khách boom"
                 ]
             }
         ],
         "Người Nhận Hàng": [
             {
                 "keywords": [
+                    "đặt hàng", 
+                    "mua hàng", 
+                    "nhận hàng",
+                    "giao hàng",
                     "khách", "người nhận", "em nhận hàng",
                     "Chưa nhận được hàng",
                     "Giao trễ", "giao sai",
                     "Không liên hệ được shipper",
                     "Hẹn giao lại",
                     "Phí thu hộ khi nhận",
-                    "Không liên lạc"
+                    "Không liên lạc",
+                    "shipper gọi", 
+                    "chưa nhận được",
+                    "shipper không gọi", 
+                    "không nhận nữa", 
+                    "hàng lỗi", 
+                    "hàng bị lấy trộm"
                 ]
             }
         ],
         "Tài Xế": [
             {
                 "keywords": [
-                    "shipper, tài xế, em là NV giao hàng",
+                    "taixe", 
+                    "chạy GHN", 
+                    "shipper GHN",
+                    "shipper", "tài xế", "em là NV giao hàng",
                     "App tài xế lỗi",
                     "Không liên hệ được khách",
                     "Lấy hàng thất bại",
                     "Báo hoàn",
-                    "Cập nhật trạng thái đơn"
+                    "Cập nhật trạng thái đơn",
+                    "lương", "thu nhập", "app GHN", "đơn", "tuyến", "khách boom", "bị phạt"
                 ]
             }
         ],
@@ -319,6 +339,10 @@
             {
                 "authors": [
                     "Giao Hàng Nhanh - GHN"
+                ],
+                "keywords": [
+                    "tuyển dụng", "khai trương", "campaign", "flash sale", "đồng giá",
+                    "minigame", "giveaway", "livestream", "sale", "ưu đãi"
                 ]
             }
         ]
