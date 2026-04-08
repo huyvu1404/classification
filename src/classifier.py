@@ -354,6 +354,7 @@ async def classify_category(
     batch_size: int = 10,
     max_concurrent: int = 10,
     tqdm_func=None,
+    log_func=None,
 ) -> pd.DataFrame:
     """Classification pipeline:
     - Phase 1: sync rules cho tất cả rows
@@ -365,6 +366,11 @@ async def classify_category(
     missing = [c for c in required if c not in df.columns]
     if missing:
         print(f"Warning: missing columns {missing}")
+
+    if tqdm_func is None:
+        tqdm_func = tqdm
+    if log_func is None:
+        log_func = print
 
     classifier = LabelClassifier(project_name=project_name)
     classifier.load_pretrained_model()
@@ -387,59 +393,52 @@ async def classify_category(
     results: List[Optional[Tuple]] = [None] * len(df)
     needs_llm = []
 
-    if tqdm_func is None:
-        tqdm_func = tqdm
+    log_func(f"📋 Tổng số dòng dữ liệu: **{len(df)}**")
 
     # Phase 1: sync rules
-    print(f"Phase 1: sync rules on {len(rows_data)} rows...")
-    for idx, data in tqdm_func(rows_data, desc="Sync Rules"):
+    for idx, data in tqdm_func(rows_data, desc="⚙️ Sync Rules"):
         label, method, conf = classifier.classify_sync_rules(data)
         if label is not None:
             results[idx] = (label, method, conf)
         elif _is_topic(data):
             needs_llm.append((idx, data))
-        # comment chưa có kết quả sẽ xử lý ở phase 3/4
+
+    rule_assigned = sum(1 for r in results if r is not None)
+    log_func(f"✅ Đã gán qua rule: **{rule_assigned}** dòng — Cần LLM: **{len(needs_llm)}** dòng")
 
     cache = load_cache()
 
-    async def run_llm_batch(batch_list, desc_label):
+    async def run_llm_batch(batch_list: list, desc_label: str) -> list:
         semaphore = asyncio.Semaphore(max_concurrent)
+        all_results = []
 
-        async def classify_with_limit(batch):
+        async def classify_one(idx, data, session):
             async with semaphore:
-                return await _classify_batch(classifier, batch, session, cache)
+                try:
+                    label, method, conf = await classifier.classify_async(data, session, cache)
+                    return (idx, label, method, conf)
+                except Exception as e:
+                    print(f"Error on row {idx}: {e}")
+                    return (idx, classifier.get_default_label(), "Error", 0.0)
 
         async with aiohttp.ClientSession() as session:
-            tasks = [
-                classify_with_limit(batch_list[i:i + batch_size])
-                for i in range(0, len(batch_list), batch_size)
-            ]
-            all_results = []
-            with tqdm_func(total=len(batch_list), desc=desc_label) as pbar:
-                for coro in asyncio.as_completed(tasks):
-                    batch_results = await coro
-                    all_results.extend(batch_results)
-                    pbar.update(len(batch_results))
+            tasks = [classify_one(idx, data, session) for idx, data in batch_list]
+            pbar = tqdm_func(total=len(tasks), desc=desc_label)
+            for coro in asyncio.as_completed(tasks):
+                result = await coro
+                all_results.append(result)
+                pbar.update(1)
+            pbar.close()
         return all_results
-
-    def _run_async(coro):
-        try:
-            loop = asyncio.get_running_loop()
-            return loop.run_until_complete(coro)
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(coro)
 
     # Phase 2: LLM cho topic rows
     if needs_llm:
-        print(f"Phase 2: LLM on {len(needs_llm)} topic rows (batch={batch_size}, max_concurrent={max_concurrent})...")
-        topic_results = _run_async(run_llm_batch(needs_llm, "LLM (topics)"))
+        topic_results = await run_llm_batch(needs_llm, "🤖 LLM (topics)")
         for idx, label, method, conf in topic_results:
             results[idx] = (label, method, conf)
         save_cache(cache)
     else:
-        print("No topic rows need LLM.")
+        log_func("ℹ️ Không có topic rows nào cần LLM.")
 
     # Phase 3: gán comment rows từ topic cha qua ParentId
     topic_result_by_id: Dict[str, Tuple] = {}
@@ -469,13 +468,11 @@ async def classify_category(
 
     # Phase 4: LLM cho comment rows không được gán
     if unassigned_comments:
-        print(f"Phase 4: LLM on {len(unassigned_comments)} unassigned comment rows...")
-        comment_results = _run_async(run_llm_batch(unassigned_comments, "LLM (unassigned comments)"))
+        log_func(f"💬 LLM cho comments chưa gán: **{len(unassigned_comments)}** dòng")
+        comment_results = await run_llm_batch(unassigned_comments, "🤖 LLM (comments)")
         for idx, label, method, conf in comment_results:
             results[idx] = (label, method, conf)
         save_cache(cache)
-    else:
-        print("No unassigned comment rows.")
 
     labels, methods, confs = zip(*[r if r is not None else (None, "none", 0.0) for r in results])
     df = df.copy()

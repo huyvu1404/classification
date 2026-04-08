@@ -1,6 +1,6 @@
 import aiohttp
 from typing import Dict, List
-from src.settings import CMS_URL, CMS_REFERER, CMS_USER_NAME, CMS_PASSWORD, PROJECT_DIR
+from settings import CMS_URL, CMS_REFERER, CMS_USER_NAME, CMS_PASSWORD, PROJECT_DIR
 import time
 import json
 import os

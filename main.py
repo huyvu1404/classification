@@ -7,7 +7,7 @@ from src.classifier import classify_category
 from src.detector import detect_relevant
 
 PROJECT_LIST = ["Shopee", "ShopeeFood", "SPX Express", "Giao Hàng Nhanh"]
-DETECTOR_PROJECT_LIST = ["Vinamilk"]
+DETECTOR_PROJECT_LIST = ["Vinamilk", "Đối thủ"]
 
 if "disabled" not in st.session_state:
     st.session_state["disabled"] = False
@@ -144,6 +144,7 @@ async def app():
                             use_llm=True,
                             batch_size=10,
                             tqdm_func=stqdm,
+                            log_func=st.write,
                         )
                         st.session_state["disabled"] = True
 
@@ -179,6 +180,7 @@ async def app():
                             st.session_state["df_input"],
                             project_name=st.session_state["selected_project"],
                             tqdm_func=stqdm,
+                            log_func=st.write,
                         )
                         st.session_state["disabled"] = True
 

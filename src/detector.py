@@ -257,6 +257,7 @@ class Detector:
         batch_size: int = 20,
         max_concurrent: int = 10,
         tqdm_func=None,
+        log_func=None,
     ) -> pd.DataFrame:
         """Two-phase: sync rules first, then concurrent LLM batches.
         LLM chỉ được gọi cho topic rows. Comment rows được gán kết quả từ topic cha (ParentId).
@@ -267,6 +268,8 @@ class Detector:
 
         if tqdm_func is None:
             tqdm_func = tqdm
+        if log_func is None:
+            log_func = print
 
         has_parent_id = "ParentId" in df.columns
         has_type = "Type" in df.columns
@@ -283,6 +286,8 @@ class Detector:
             t = str(row.get("Type", "")).lower()
             return "comment" in t
 
+        log_func(f"📋 Tổng số dòng dữ liệu: **{len(df)}**")
+
         # Phase 1: sync rules cho tất cả rows
         for idx, row in df.iterrows():
             result, rule = self._detect_sync(row)
@@ -292,43 +297,39 @@ class Detector:
                 needs_llm.append((idx, row))
             # comment rows chưa có kết quả sẽ xử lý sau phase 2
 
+        rule_assigned = len(results)
+        log_func(f"✅ Đã gán qua rule: **{rule_assigned}** dòng — Cần LLM: **{len(needs_llm)}** dòng")
+
         # Phase 2: LLM cho topic rows
         cache = load_cache()
         topic_llm_results: Dict[int, Tuple[str, str]] = {}
 
         if needs_llm and use_llm:
-            print(f"\nLLM: processing {len(needs_llm)} topic rows (batch={batch_size}, concurrent={max_concurrent})...")
             semaphore = asyncio.Semaphore(max_concurrent)
 
-            async def limited_batch(batch: List[Tuple[int, pd.Series]], session: aiohttp.ClientSession):
+            async def detect_one(idx: int, row: pd.Series, session: aiohttp.ClientSession):
                 async with semaphore:
-                    out = []
-                    for idx, row in batch:
-                        try:
-                            out.append(await self._detect_row_llm(idx, row, session, cache))
-                        except Exception as e:
-                            print(f"Error on row {idx}: {e}")
-                            out.append((idx, "No", "Error"))
-                    return out
+                    try:
+                        return await self._detect_row_llm(idx, row, session, cache)
+                    except Exception as e:
+                        print(f"Error on row {idx}: {e}")
+                        return (idx, "No", "Error")
 
-            async def run_llm():
-                async with aiohttp.ClientSession() as session:
-                    batches = [needs_llm[i:i + batch_size] for i in range(0, len(needs_llm), batch_size)]
-                    with tqdm_func(total=len(needs_llm), desc="LLM (topics)") as pbar:
-                        for coro in asyncio.as_completed([limited_batch(b, session) for b in batches]):
-                            batch_results = await coro
-                            for idx, result, rule in batch_results:
-                                topic_llm_results[idx] = (result, rule)
-                            pbar.update(len(batch_results))
+            pbar = tqdm_func(total=len(needs_llm), desc="🔍 LLM (topics)")
+            async with aiohttp.ClientSession() as session:
+                tasks = [detect_one(idx, row, session) for idx, row in needs_llm]
+                for coro in asyncio.as_completed(tasks):
+                    idx, result, rule = await coro
+                    topic_llm_results[idx] = (result, rule)
+                    pbar.update(1)
+            pbar.close()
 
-            await run_llm()
             save_cache(cache)
         else:
             if needs_llm and not use_llm:
                 print(f"LLM disabled. Marking {len(needs_llm)} topic rows as No.")
             for idx, _ in needs_llm:
                 topic_llm_results[idx] = ("No", "No Match")
-
         results.update(topic_llm_results)
 
         # Phase 3: gán kết quả cho comment rows dựa vào ParentId
@@ -356,31 +357,26 @@ class Detector:
 
         # Phase 4: LLM cho comment rows không được gán
         if unassigned_comments and use_llm:
-            print(f"\nLLM: processing {len(unassigned_comments)} unassigned comment rows...")
+            log_func(f"💬 LLM cho comments chưa gán: **{len(unassigned_comments)}** dòng")
             semaphore = asyncio.Semaphore(max_concurrent)
 
-            async def limited_batch_comments(batch: List[Tuple[int, pd.Series]], session: aiohttp.ClientSession):
+            async def detect_one_comment(idx: int, row: pd.Series, session: aiohttp.ClientSession):
                 async with semaphore:
-                    out = []
-                    for idx, row in batch:
-                        try:
-                            out.append(await self._detect_row_llm(idx, row, session, cache))
-                        except Exception as e:
-                            print(f"Error on row {idx}: {e}")
-                            out.append((idx, "No", "Error"))
-                    return out
+                    try:
+                        return await self._detect_row_llm(idx, row, session, cache)
+                    except Exception as e:
+                        print(f"Error on row {idx}: {e}")
+                        return (idx, "No", "Error")
 
-            async def run_llm_comments():
-                async with aiohttp.ClientSession() as session:
-                    batches = [unassigned_comments[i:i + batch_size] for i in range(0, len(unassigned_comments), batch_size)]
-                    with tqdm_func(total=len(unassigned_comments), desc="LLM (unassigned comments)") as pbar:
-                        for coro in asyncio.as_completed([limited_batch_comments(b, session) for b in batches]):
-                            batch_results = await coro
-                            for idx, result, rule in batch_results:
-                                results[idx] = (result, rule)
-                            pbar.update(len(batch_results))
+            pbar = tqdm_func(total=len(unassigned_comments), desc="🔍 LLM (comments)")
+            async with aiohttp.ClientSession() as session:
+                tasks = [detect_one_comment(idx, row, session) for idx, row in unassigned_comments]
+                for coro in asyncio.as_completed(tasks):
+                    idx, result, rule = await coro
+                    results[idx] = (result, rule)
+                    pbar.update(1)
+            pbar.close()
 
-            await run_llm_comments()
             save_cache(cache)
         else:
             for idx, _ in unassigned_comments:
@@ -391,13 +387,8 @@ class Detector:
         df = df.copy()
         df["Yes/No"] = df.index.map(lambda i: results.get(i, ("No", "No Match"))[0])
 
-        rule_stats: Dict[str, int] = {}
-        for _, rule in results.values():
-            rule_stats[rule] = rule_stats.get(rule, 0) + 1
-
-        print("\nRule stats:", {k: v for k, v in rule_stats.items() if v})
         yes = (df["Yes/No"] == "Yes").sum()
-        print(f"Yes: {yes} ({yes / len(df) * 100:.1f}%)  No: {len(df) - yes}")
+        log_func(f"🏁 Kết quả: **Yes: {yes}** ({yes / len(df) * 100:.1f}%)  |  **No: {len(df) - yes}**")
 
         return sanitize_excel_values(df)
 
@@ -415,7 +406,9 @@ async def detect_relevant(
     batch_size: int = 20,
     max_concurrent: int = 10,
     tqdm_func=None,
+    log_func=None,
 ) -> pd.DataFrame:
     return await Detector(project_name=project_name).detect_async(
-        df, use_llm=use_llm, batch_size=batch_size, max_concurrent=max_concurrent, tqdm_func=tqdm_func
+        df, use_llm=use_llm, batch_size=batch_size, max_concurrent=max_concurrent,
+        tqdm_func=tqdm_func, log_func=log_func,
     )
