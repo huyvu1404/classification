@@ -182,16 +182,14 @@ class Detector:
         if not name_tag_prompt and not relevance_prompt:
             return None
 
-        # Gọi song song 2 LLM calls thay vì tuần tự
-        include_name_tag, is_relevant = await asyncio.gather(
-            self._call_llm(name_tag_prompt, session),
-            self._call_llm(relevance_prompt, session),
-        )
+        # Gọi name_tag trước, chỉ gọi relevance nếu name_tag trả về False
+        include_name_tag = await self._call_llm(name_tag_prompt, session)
 
         if include_name_tag:
             set_cached(cache, title, content, description, "Yes")
             return "Yes"
 
+        is_relevant = await self._call_llm(relevance_prompt, session)
         result = "Yes" if is_relevant else None
         set_cached(cache, title, content, description, result)
         return result
@@ -259,10 +257,7 @@ class Detector:
         tqdm_func=None,
         log_func=None,
     ) -> pd.DataFrame:
-        """Two-phase: sync rules first, then concurrent LLM batches.
-        LLM chỉ được gọi cho topic rows. Comment rows được gán kết quả từ topic cha (ParentId).
-        Comment không được gán sẽ được call LLM sau.
-        """
+        """Two-phase: sync rules first, then concurrent LLM for all remaining rows."""
         results: Dict[int, Tuple[str, str]] = {}
         needs_llm: List[Tuple[int, pd.Series]] = []
 
@@ -271,21 +266,6 @@ class Detector:
         if log_func is None:
             log_func = print
 
-        has_parent_id = "ParentId" in df.columns
-        has_type = "Type" in df.columns
-
-        def _is_topic(row: pd.Series) -> bool:
-            if not has_type:
-                return True
-            t = str(row.get("Type", "")).lower()
-            return "topic" in t
-
-        def _is_comment_row(row: pd.Series) -> bool:
-            if not has_type:
-                return False
-            t = str(row.get("Type", "")).lower()
-            return "comment" in t
-
         log_func(f"📋 Tổng số dòng dữ liệu: **{len(df)}**")
 
         # Phase 1: sync rules cho tất cả rows
@@ -293,16 +273,17 @@ class Detector:
             result, rule = self._detect_sync(row)
             if result is not None:
                 results[idx] = (result, rule)
-            elif _is_topic(row):
+            else:
                 needs_llm.append((idx, row))
-            # comment rows chưa có kết quả sẽ xử lý sau phase 2
 
         rule_assigned = len(results)
-        log_func(f"✅ Đã gán qua rule: **{rule_assigned}** dòng — Cần LLM: **{len(needs_llm)}** dòng")
+        log_func(
+            f"✅ Đã gán qua rule: **{rule_assigned}** dòng — "
+            f"Cần LLM: **{len(needs_llm)}** dòng"
+        )
 
-        # Phase 2: LLM cho topic rows
+        # Phase 2: LLM cho tất cả rows chưa có kết quả
         cache = load_cache()
-        topic_llm_results: Dict[int, Tuple[str, str]] = {}
 
         if needs_llm and use_llm:
             semaphore = asyncio.Semaphore(max_concurrent)
@@ -315,62 +296,9 @@ class Detector:
                         print(f"Error on row {idx}: {e}")
                         return (idx, "No", "Error")
 
-            pbar = tqdm_func(total=len(needs_llm), desc="🔍 LLM (topics)")
+            pbar = tqdm_func(total=len(needs_llm), desc="🔍 LLM")
             async with aiohttp.ClientSession() as session:
                 tasks = [detect_one(idx, row, session) for idx, row in needs_llm]
-                for coro in asyncio.as_completed(tasks):
-                    idx, result, rule = await coro
-                    topic_llm_results[idx] = (result, rule)
-                    pbar.update(1)
-            pbar.close()
-
-            save_cache(cache)
-        else:
-            if needs_llm and not use_llm:
-                print(f"LLM disabled. Marking {len(needs_llm)} topic rows as No.")
-            for idx, _ in needs_llm:
-                topic_llm_results[idx] = ("No", "No Match")
-        results.update(topic_llm_results)
-
-        # Phase 3: gán kết quả cho comment rows dựa vào ParentId
-        # Build map: parent_id_value -> result từ topic row
-        topic_result_by_id: Dict[str, Tuple[str, str]] = {}
-        if has_parent_id and "Id" in df.columns:
-            for idx, row in df.iterrows():
-                if _is_topic(row) and idx in results:
-                    row_id = str(row.get("Id", "")).strip()
-                    if row_id:
-                        topic_result_by_id[row_id] = results[idx]
-
-        # Gán comment rows chưa có kết quả
-        unassigned_comments: List[Tuple[int, pd.Series]] = []
-        for idx, row in df.iterrows():
-            if idx in results:
-                continue
-            if _is_comment_row(row):
-                if has_parent_id:
-                    parent_id = str(row.get("ParentId", "")).strip()
-                    if parent_id and parent_id in topic_result_by_id:
-                        results[idx] = (topic_result_by_id[parent_id][0], "Inherited from Topic")
-                        continue
-                unassigned_comments.append((idx, row))
-
-        # Phase 4: LLM cho comment rows không được gán
-        if unassigned_comments and use_llm:
-            log_func(f"💬 LLM cho comments chưa gán: **{len(unassigned_comments)}** dòng")
-            semaphore = asyncio.Semaphore(max_concurrent)
-
-            async def detect_one_comment(idx: int, row: pd.Series, session: aiohttp.ClientSession):
-                async with semaphore:
-                    try:
-                        return await self._detect_row_llm(idx, row, session, cache)
-                    except Exception as e:
-                        print(f"Error on row {idx}: {e}")
-                        return (idx, "No", "Error")
-
-            pbar = tqdm_func(total=len(unassigned_comments), desc="🔍 LLM (comments)")
-            async with aiohttp.ClientSession() as session:
-                tasks = [detect_one_comment(idx, row, session) for idx, row in unassigned_comments]
                 for coro in asyncio.as_completed(tasks):
                     idx, result, rule = await coro
                     results[idx] = (result, rule)
@@ -379,9 +307,10 @@ class Detector:
 
             save_cache(cache)
         else:
-            for idx, _ in unassigned_comments:
-                if idx not in results:
-                    results[idx] = ("No", "No Match")
+            if needs_llm and not use_llm:
+                log_func(f"LLM disabled. Marking {len(needs_llm)} rows as No.")
+            for idx, _ in needs_llm:
+                results[idx] = ("No", "No Match")
 
         # Assign back
         df = df.copy()
