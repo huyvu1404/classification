@@ -351,16 +351,14 @@ def _row_to_dict(row) -> Dict:
 async def classify_category(
     df: pd.DataFrame,
     project_name: str,
-    batch_size: int = 10,
+    batch_size: int = 20,
     max_concurrent: int = 10,
     tqdm_func=None,
     log_func=None,
 ) -> pd.DataFrame:
     """Classification pipeline:
     - Phase 1: sync rules cho tất cả rows
-    - Phase 2: LLM chỉ cho topic rows
-    - Phase 3: gán kết quả cho comment rows có cùng ParentId với topic
-    - Phase 4: LLM cho comment rows không được gán
+    - Phase 2: LLM cho tất cả rows chưa có kết quả (không inherit)
     """
     required = ["Id", "Title", "Content", "Description", "Type", "SiteName"]
     missing = [c for c in required if c not in df.columns]
@@ -376,105 +374,58 @@ async def classify_category(
     classifier.load_pretrained_model()
     classifier._get_valid_labels()
 
-    has_parent_id = "ParentId" in df.columns
-    has_type = "Type" in df.columns
-
-    def _is_topic(data: dict) -> bool:
-        if not has_type:
-            return True
-        return "topic" in data.get("type", "").lower()
-
-    def _is_comment(data: dict) -> bool:
-        if not has_type:
-            return False
-        return "comment" in data.get("type", "").lower()
-
-    rows_data = [(row.Index, _row_to_dict(row)) for row in df.itertuples()]
-    results: List[Optional[Tuple]] = [None] * len(df)
-    needs_llm = []
+    results: Dict[int, Tuple[str, str, float]] = {}
+    needs_llm_indices: List[int] = []
 
     log_func(f"📋 Tổng số dòng dữ liệu: **{len(df)}**")
 
     # Phase 1: sync rules
-    for idx, data in tqdm_func(rows_data, desc="⚙️ Sync Rules"):
+    for row in tqdm_func(df.itertuples(), total=len(df), desc="⚙️ Sync Rules"):
+        idx = row.Index
+        data = _row_to_dict(row)
         label, method, conf = classifier.classify_sync_rules(data)
         if label is not None:
             results[idx] = (label, method, conf)
-        elif _is_topic(data):
-            needs_llm.append((idx, data))
+        else:
+            needs_llm_indices.append(idx)
 
-    rule_assigned = sum(1 for r in results if r is not None)
-    log_func(f"✅ Đã gán qua rule: **{rule_assigned}** dòng — Cần LLM: **{len(needs_llm)}** dòng")
+    rule_assigned = len(results)
+    log_func(f"✅ Đã gán qua rule: **{rule_assigned}** dòng — Cần LLM: **{len(needs_llm_indices)}** dòng")
 
+    # Phase 2: LLM cho tất cả rows chưa có kết quả
     cache = load_cache()
 
-    async def run_llm_batch(batch_list: list, desc_label: str) -> list:
+    if needs_llm_indices:
         semaphore = asyncio.Semaphore(max_concurrent)
-        all_results = []
 
-        async def classify_one(idx, data, session):
+        async def classify_one(idx: int, session: aiohttp.ClientSession):
             async with semaphore:
                 try:
+                    data = _row_to_dict(df.iloc[idx])
                     label, method, conf = await classifier.classify_async(data, session, cache)
                     return (idx, label, method, conf)
                 except Exception as e:
                     print(f"Error on row {idx}: {e}")
                     return (idx, classifier.get_default_label(), "Error", 0.0)
 
+        pbar = tqdm_func(total=len(needs_llm_indices), desc="🤖 LLM")
         async with aiohttp.ClientSession() as session:
-            tasks = [classify_one(idx, data, session) for idx, data in batch_list]
-            pbar = tqdm_func(total=len(tasks), desc=desc_label)
-            for coro in asyncio.as_completed(tasks):
-                result = await coro
-                all_results.append(result)
-                pbar.update(1)
-            pbar.close()
-        return all_results
-
-    # Phase 2: LLM cho topic rows
-    if needs_llm:
-        topic_results = await run_llm_batch(needs_llm, "🤖 LLM (topics)")
-        for idx, label, method, conf in topic_results:
-            results[idx] = (label, method, conf)
+            # Batch processing để tránh tạo quá nhiều tasks cùng lúc
+            for i in range(0, len(needs_llm_indices), batch_size):
+                batch_indices = needs_llm_indices[i:i+batch_size]
+                tasks = [classify_one(idx, session) for idx in batch_indices]
+                
+                for coro in asyncio.as_completed(tasks):
+                    idx, label, method, conf = await coro
+                    results[idx] = (label, method, conf)
+                    pbar.update(1)
+        pbar.close()
         save_cache(cache)
     else:
-        log_func("ℹ️ Không có topic rows nào cần LLM.")
+        log_func("ℹ️ Không có rows nào cần LLM.")
 
-    # Phase 3: gán comment rows từ topic cha qua ParentId
-    topic_result_by_id: Dict[str, Tuple] = {}
-    if has_parent_id and "Id" in df.columns:
-        for row in df.itertuples():
-            idx = row.Index
-            data = _row_to_dict(row)
-            if _is_topic(data) and results[idx] is not None:
-                row_id = str(getattr(row, "Id", "")).strip()
-                if row_id:
-                    topic_result_by_id[row_id] = results[idx]
-
-    unassigned_comments = []
-    for row in df.itertuples():
-        idx = row.Index
-        if results[idx] is not None:
-            continue
-        data = _row_to_dict(row)
-        if _is_comment(data):
-            if has_parent_id:
-                parent_id = str(getattr(row, "ParentId", "")).strip()
-                if parent_id and parent_id in topic_result_by_id:
-                    parent_label, parent_method, parent_conf = topic_result_by_id[parent_id]
-                    results[idx] = (parent_label, "Inherited from Topic", parent_conf)
-                    continue
-            unassigned_comments.append((idx, data))
-
-    # Phase 4: LLM cho comment rows không được gán
-    if unassigned_comments:
-        log_func(f"💬 LLM cho comments chưa gán: **{len(unassigned_comments)}** dòng")
-        comment_results = await run_llm_batch(unassigned_comments, "🤖 LLM (comments)")
-        for idx, label, method, conf in comment_results:
-            results[idx] = (label, method, conf)
-        save_cache(cache)
-
-    labels, methods, confs = zip(*[r if r is not None else (None, "none", 0.0) for r in results])
+    # Assign back
     df = df.copy()
-    df["Label"] = labels
+    df["Label"] = df.index.map(lambda i: results.get(i, (classifier.get_default_label(), "Unknown", 0.0))[0])
+    
     return sanitize_excel_values(df)

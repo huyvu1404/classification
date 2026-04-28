@@ -131,9 +131,10 @@ class Detector:
         matches = self._find_matches(text, keywords)
         return bool(matches)
     
-    def _check_author(self, author: str) ->List[str]:
+    def _check_author(self, author: str) -> bool:
         if self.project_name.lower().strip() in author.lower().strip():
-            return True, 0.95
+            return True
+        return False
         
     async def _call_llm(self, prompt: str, session: aiohttp.ClientSession) -> bool:
         try:
@@ -259,7 +260,7 @@ class Detector:
     ) -> pd.DataFrame:
         """Two-phase: sync rules first, then concurrent LLM for all remaining rows."""
         results: Dict[int, Tuple[str, str]] = {}
-        needs_llm: List[Tuple[int, pd.Series]] = []
+        needs_llm_indices: List[int] = []  # Chỉ lưu index, không lưu row
 
         if tqdm_func is None:
             tqdm_func = tqdm
@@ -274,42 +275,47 @@ class Detector:
             if result is not None:
                 results[idx] = (result, rule)
             else:
-                needs_llm.append((idx, row))
+                needs_llm_indices.append(idx)
 
         rule_assigned = len(results)
         log_func(
             f"✅ Đã gán qua rule: **{rule_assigned}** dòng — "
-            f"Cần LLM: **{len(needs_llm)}** dòng"
+            f"Cần LLM: **{len(needs_llm_indices)}** dòng"
         )
 
         # Phase 2: LLM cho tất cả rows chưa có kết quả
         cache = load_cache()
 
-        if needs_llm and use_llm:
+        if needs_llm_indices and use_llm:
             semaphore = asyncio.Semaphore(max_concurrent)
 
-            async def detect_one(idx: int, row: pd.Series, session: aiohttp.ClientSession):
+            async def detect_one(idx: int, session: aiohttp.ClientSession):
                 async with semaphore:
                     try:
+                        row = df.loc[idx]  # Lấy row khi cần, không giữ reference
                         return await self._detect_row_llm(idx, row, session, cache)
                     except Exception as e:
                         print(f"Error on row {idx}: {e}")
                         return (idx, "No", "Error")
 
-            pbar = tqdm_func(total=len(needs_llm), desc="🔍 LLM")
+            pbar = tqdm_func(total=len(needs_llm_indices), desc="🔍 LLM")
             async with aiohttp.ClientSession() as session:
-                tasks = [detect_one(idx, row, session) for idx, row in needs_llm]
-                for coro in asyncio.as_completed(tasks):
-                    idx, result, rule = await coro
-                    results[idx] = (result, rule)
-                    pbar.update(1)
+                # Tạo tasks từng batch để tránh tốn memory
+                for i in range(0, len(needs_llm_indices), batch_size):
+                    batch_indices = needs_llm_indices[i:i+batch_size]
+                    tasks = [detect_one(idx, session) for idx in batch_indices]
+                    
+                    for coro in asyncio.as_completed(tasks):
+                        idx, result, rule = await coro
+                        results[idx] = (result, rule)
+                        pbar.update(1)
             pbar.close()
 
             save_cache(cache)
         else:
-            if needs_llm and not use_llm:
-                log_func(f"LLM disabled. Marking {len(needs_llm)} rows as No.")
-            for idx, _ in needs_llm:
+            if needs_llm_indices and not use_llm:
+                log_func(f"LLM disabled. Marking {len(needs_llm_indices)} rows as No.")
+            for idx in needs_llm_indices:
                 results[idx] = ("No", "No Match")
 
         # Assign back
